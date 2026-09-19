@@ -108,32 +108,68 @@ The brief permits any language (*"You may use any language, framework, database,
 
 v3.1 amendment #24 added `Tool<I, O extends JsonValue>` so the type system could prevent a tool declaring a non-JSON output. Python generics cannot express that constraint as tightly. The Python form requires each tool's output schema to be a Pydantic model, and the execution boundary serializes it with `model_dump(mode="json")`.
 
-The guarantee is preserved and in one respect strengthened: `mode="json"` **coerces** to JSON-safe form rather than merely checking, so a `datetime` field becomes an ISO string automatically instead of being rejected. What is lost is compile-time rejection; what is gained is that the bad case cannot occur at all. Net: acceptable, and the reasoning belongs in `SUBMISSION.md`.
+**This is a different guarantee, not the same one enforced later.** The distinction is material and must be stated as such:
 
-**(2) Tool cancellation — genuine, not cooperative.**
+```
+   TypeScript:  a datetime-typed output field is REJECTED at compile time
+   Python:      a datetime-typed output field is NORMALIZED to an ISO string
+```
 
-This is a real improvement to the weakest guarantee in the design. §5.4 states that a timed-out tool is *abandoned, not killed*, because JavaScript cannot force a promise to stop. `asyncio` raises `CancelledError` **inside** the coroutine at its next await point, so an async tool is genuinely cancelled.
+What the Python contract gives: nothing non-JSON-safe can reach the trace, the evidence ledger, or the JSONL export — the bad *value* cannot occur. What it costs: a tool that returns a `datetime` where a string was intended is silently converted rather than caught, so that class of tool bug becomes invisible at this boundary.
+
+Both halves belong in `SUBMISSION.md`. Do not write "the guarantee holds."
+
+**(2) Tool cancellation — delivered automatically, still cooperative.**
+
+A real improvement to the weakest guarantee in the design, stated precisely:
+
+> asyncio cancellation is delivered to an awaiting coroutine automatically through task cancellation; the coroutine observes `CancelledError` at an await point unless it suppresses cancellation. Unlike the original JavaScript mechanism, **no separately composed abort signal is required** to make an ordinary awaiting coroutine cancellable.
+
+**Do not write "genuine rather than cooperative."** Both mechanisms are cooperative — a coroutine must reach an await point and must not suppress. What differs is the *threshold*:
+
+```
+   JavaScript:  default is ABANDONMENT — the author must opt in (wire an AbortSignal)
+   asyncio:     default is CANCELLATION — the author must opt out (suppress CancelledError)
+```
+
+That contrast is the accurate, defensible claim and the one worth making in `SUBMISSION.md`.
 
 Consequences:
 
-- `ToolContext` no longer carries a cancellation signal. Cancellation arrives as an exception at an await point, which is the idiomatic Python mechanism; a tool needing cleanup uses `try/finally`. The `AbortSignal` field is removed.
-- Build-plan correction 3.4.5.3 — "the per-call controller is never aborted" — becomes **structurally impossible** in this materialization. There is no controller to forget to abort.
-- The `causedByRunDeadline` precedence rule is unchanged in substance. After catching `TimeoutError`, classification asks whether the run deadline has passed (`clock.now() >= deadline_at`), which is the same "check state, not timer ordering" principle that §5.4 specifies — not which timer happened to fire.
-- The honest limitation narrows but does not vanish: a tool doing **blocking synchronous work** (or one that suppresses `CancelledError`) still cannot be interrupted. `SUBMISSION.md` should state the narrower, more accurate version rather than the JavaScript one.
+- `ToolContext` no longer carries a cancellation signal; a tool needing cleanup uses `try/finally`.
+- Build-plan correction 3.4.5.3 — "the per-call controller is never aborted" — becomes **structurally impossible**. There is no controller to forget to abort.
+- **Cancellation ownership must be explicit.** `asyncio.timeout()` converts the cancellations *it* raises into `TimeoutError`; a cancellation arriving from outside propagates untouched. Therefore no handler anywhere may catch `BaseException` — `CancelledError` derives from it, and catching it would turn an external shutdown into a tool failure.
+- The honest limitation narrows but does not vanish: blocking synchronous work cannot be interrupted, and code that suppresses `CancelledError` defeats it.
 
 **(3) Deterministic timing — no fake-timer library.**
 
 Round-3 finding #9 required naming a fake-timer strategy because a fake clock does not advance `setTimeout`. Python does not need one. Timeouts are already injected through `Limits`, so tests set `tool_timeout_ms = 10` and have the fake tool `await asyncio.sleep(999)`. The cancellation fires in about ten milliseconds against a thousand-fold margin — fast, deterministic, and free of fake-timer machinery. The injected clock continues to drive budget arithmetic and trace timestamps exactly as specified.
 
-Two simplifications also fall out, both from `asyncio` owning the lifecycle: the "attach a no-op catch to the loser" requirement disappears because the losing task is cancelled rather than orphaned, and the `clearTimeout` / `unref` requirements disappear because there are no raw timers to leak. Build-plan steps 1.4.3.1, 1.4.3.5 and 1.4.4.2 collapse into the context manager. **Everything else about the deadline contract — the precedence rule, the classification, the penalty suppression — stands exactly as locked.**
+Two simplifications also fall out, both from `asyncio` owning the lifecycle: the "attach a no-op catch to the loser" requirement disappears because the losing task is cancelled rather than orphaned, and the timer-cleanup requirements disappear because there are no raw timers to leak. **Everything else about the deadline contract — the precedence rule, the classification, the penalty suppression — stands exactly as locked.**
+
+**(3a) Deadline classification is decided by the binding limit, before awaiting.**
+
+The first Python draft implemented the precedence rule by comparing the clock *after* the timeout fired. That reintroduces the exact bug the rule exists to prevent: with `tool_timeout=5000ms` and `remaining=2000ms`, the asyncio timer may fire at ~1999.7ms of real time while an integer-millisecond clock still reports `now < deadline_at` — so a run-deadline abort is classified as a tool timeout, and **a healthy tool takes a strike for the harness's own clock.**
+
+The rule is therefore:
+
+```
+   binding_is_run_deadline = remaining_ms <= timeout_ms     # decided BEFORE the await
+   caused_by_run_deadline  = binding_is_run_deadline
+                             or clock() >= deadline_at_ms   # secondary check only
+```
+
+Both operands are known before awaiting, so the primary determination is race-free. **Exact equality classifies as `run_deadline`** — where there is no fact of the matter, resolve toward not blaming the tool. The clock comparison remains as a secondary term covering event-loop starvation, where the tool timer is nominally shorter but enough wall time elapsed that the run deadline also passed.
+
+This preserves the locked principle — *check state, not timer ordering* — by checking the state earlier, where it is not subject to a race.
 
 #### Naming adjustments to avoid stdlib and package shadowing
 
 | Locked name | Python file | Reason |
 | --- | --- | --- |
-| `model/types.ts` | `model/contracts.py` | `types` shadows a standard-library module |
-| `tools/types.ts` | `tools/contracts.py` | same |
-| `model/anthropic.ts` | `model/anthropic_adapter.py` | avoids confusion with the installed `anthropic` package |
+| `model/contracts.py` | `model/contracts.py` | `types` shadows a standard-library module |
+| `tools/contracts.py` | `tools/contracts.py` | same |
+| `model/anthropic_adapter.py` | `model/anthropic_adapter.py` | avoids confusion with the installed `anthropic` package |
 
 ---
 
@@ -168,13 +204,13 @@ Each layer treats the layer above as **untrusted input**. The runtime validates 
         │
         ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  cli/main.ts — parseArgs, build Deps, invoke run(), render, exit code     │
+│  cli/main.py — argparse, build Deps, invoke run(), render, exit code      │
 │                outermost boundary: unexpected throw → exit 2 (§6.4)       │
 └──────────────────────────────┬───────────────────────────────────────────┘
                                │ objective + Deps{model,registry,clock,ids,trace,limits}
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          agent/loop.ts · run()                           │
+│                          agent/loop.py · run()                           │
 │                     the ONLY orchestration authority                     │
 │                                                                          │
 │   deadline = clock.now() + maxWallClockMs  →  runSignal ──────────┐       │
@@ -191,7 +227,7 @@ Each layer treats the layer above as **untrusted input**. The runtime validates 
 │           │                    └─ throw ─▶ ModelCallError ─▶ retry ×1     │
 │           ◀── unknown (untrusted) ───────────────────▶ else model_error   │
 │           ▼                                                               │
-│   ModelDecisionSchema.safeParse()   ── fail ─▶ protocol correction (×2)   │
+│   validate decision against the union  ── fail ─▶ protocol correction (×2) │
 │     ┌─────┴─────┐                                                         │
 │     ▼           ▼                                                         │
 │   final      tool_calls[1..4]                                             │
@@ -219,8 +255,8 @@ Each layer treats the layer above as **untrusted input**. The runtime validates 
       │           ▲
       │           │  every step emits
       │   ┌───────┴──────────────────────────────┐
-      │   │ trace/recorder.ts                    │
-      │   │ structuredClone → redact → truncate  │
+      │   │ trace/recorder.py                    │
+      │   │ deepcopy → redact → truncate         │
       │   │ → seq++ → append → sinks             │
       │   │   ◀── the single emit chokepoint     │
       │   └───────┬──────────────────────────────┘
@@ -242,22 +278,22 @@ Each layer treats the layer above as **untrusted input**. The runtime validates 
 
 | Module | Responsibility | Input → Output | Must NOT own |
 | --- | --- | --- | --- |
-| `cli/main.ts` | Parse argv, build `Deps`, run, render, exit code, outermost error boundary | argv → exit | Loop, decision, or failure logic |
-| `cli/render.ts` | Pretty trace + 4-section report; JSONL export; `agent tools` output | `RunResult` → string | Redaction (done at record time), interpretation |
-| `agent/loop.ts` | **The control loop.** Sequencing, gates, decision handling, termination | `objective, Deps` → `RunResult` | Provider formats, tool internals, rendering |
-| `agent/state.ts` | `RunState`, `Turn`, `JsonValue`, `project()`, `toModelTurn()` | `RunState` → `ModelRequest` | Transition policy (loop owns it) |
-| `agent/budget.ts` | `Limits`, `Deadline`, `check(state, now)`, `remainingMs()`, `withDeadline()` | `RunState, now` → `{exhausted, reason}` | Deciding what to do about exhaustion |
-| `agent/policy.ts` | `ToolErrorKind`, `applyFailurePolicy()`, `withdraw()`, `terminate()`, `STATUS_BY_REASON` | `RunState, ToolOutcome` → mutation | Detecting failures (executor does) |
-| `agent/result.ts` | `buildEvidence()`, `validateFinal()`, `deriveGaps()`, `finalize()`, `RunResult` | `TraceEvent[]` → `RunResult` | Calling the model or any tool — **ever** |
-| `agent/instructions.ts` | Versioned static agent instructions | — | Runtime behavior |
-| `model/types.ts` | `ModelClient`, `ModelRequest`, schemas, `ModelCallError` | — | Implementations |
-| `model/scripted.ts` | Deterministic decisions; records received requests | `ModelRequest` → `unknown` | Awareness of tools or trace |
-| `model/anthropic.ts` | Translate request→API, response→decision shape, errors→`ModelCallError`, capture usage | `ModelRequest` → `unknown` | Validation, retries, budget |
-| `tools/types.ts` | `Tool`, `ToolContext`, `ToolOutcome` | — | — |
-| `tools/registry.ts` | **Stateless** catalog: construct, dup-check, lookup, `specs()` | `Tool[]` → catalog | Availability state (RunState owns it), execution |
-| `tools/execute.ts` | `executeToolCall()` — trust boundary, deadline, summary clamp | `call, unavailable, ctx` → `ToolOutcome` | Retry decisions, trace writes, state mutation |
-| `trace/recorder.ts` | `TraceEvent` union, clone, redact, truncate, seq, append | `TraceEvent` → void | Interpreting or filtering events |
-| `tools/impl/*.ts` (4) | One tool each: schemas, execute, summarize | typed I → typed O | Knowledge of the loop or model; **any mutable state** |
+| `cli/main.py` | Parse argv, build `Deps`, run, render, exit code, outermost error boundary | argv → exit | Loop, decision, or failure logic |
+| `cli/render.py` | Pretty trace + 4-section report; JSONL export; `agent tools` output | `RunResult` → string | Redaction (done at record time), interpretation |
+| `agent/loop.py` | **The control loop.** Sequencing, gates, decision handling, termination | `objective, Deps` → `RunResult` | Provider formats, tool internals, rendering |
+| `agent/state.py` | `RunState`, `Turn`, `JsonValue`, `project()`, `toModelTurn()` | `RunState` → `ModelRequest` | Transition policy (loop owns it) |
+| `agent/budget.py` | `Limits`, `Deadline`, `check(state, now)`, `remainingMs()`, `withDeadline()` | `RunState, now` → `{exhausted, reason}` | Deciding what to do about exhaustion |
+| `agent/policy.py` | `ToolErrorKind`, `applyFailurePolicy()`, `withdraw()`, `terminate()`, `STATUS_BY_REASON` | `RunState, ToolOutcome` → mutation | Detecting failures (executor does) |
+| `agent/result.py` | `buildEvidence()`, `validateFinal()`, `deriveGaps()`, `finalize()`, `RunResult` | `TraceEvent[]` → `RunResult` | Calling the model or any tool — **ever** |
+| `agent/instructions.py` | Versioned static agent instructions | — | Runtime behavior |
+| `model/contracts.py` | `ModelClient`, `ModelRequest`, schemas, `ModelCallError` | — | Implementations |
+| `model/scripted.py` | Deterministic decisions; records received requests | `ModelRequest` → `unknown` | Awareness of tools or trace |
+| `model/anthropic_adapter.py` | Translate request→API, response→decision shape, errors→`ModelCallError`, capture usage | `ModelRequest` → `unknown` | Validation, retries, budget |
+| `tools/contracts.py` | `Tool`, `ToolContext`, `ToolOutcome` | — | — |
+| `tools/registry.py` | **Stateless** catalog: construct, dup-check, lookup, `specs()` | `Tool[]` → catalog | Availability state (RunState owns it), execution |
+| `tools/execute.py` | `executeToolCall()` — trust boundary, deadline, summary clamp | `call, unavailable, ctx` → `ToolOutcome` | Retry decisions, trace writes, state mutation |
+| `trace/recorder.py` | `TraceEvent` union, clone, redact, truncate, seq, append | `TraceEvent` → void | Interpreting or filtering events |
+| `tools/impl/*.py` (4) | One tool each: schemas, execute, summarize | typed I → typed O | Knowledge of the loop or model; **any mutable state** |
 
 **Deliberately absent:** DI container, event bus, `BaseAgent`/`BaseTool` inheritance, plugin loader, `Policy` interface with one implementation, middleware chain, graph/node model, config-driven loop shape, `TraceSink` abstraction (§16).
 
@@ -377,6 +413,8 @@ Enforced by Zod at three points: model decision `args` (must be a `JsonObject`),
 interface ModelClient {
   readonly id: string;
   propose(req: ModelRequest, signal: AbortSignal): Promise<ModelResponse>;
+  // Python: async def propose(self, req: ModelRequest) -> ModelResponse
+  //         NO signal parameter - cancellation arrives via task cancellation (A.3 item 2)
 }
 
 type ModelResponse = {
@@ -446,7 +484,7 @@ Deadline expiry during a model call maps to `wall_clock_limit`, not `model_error
 
 ### 4.5 Agent instruction contract
 
-`agent/instructions.ts` holds a **versioned static instruction set** — a first-class artifact, not an incidental string. `INSTRUCTIONS_VERSION = 'inv-1'`. It covers:
+`agent/instructions.py` holds a **versioned static instruction set** — a first-class artifact, not an incidental string. `INSTRUCTIONS_VERSION = 'inv-1'`. It covers:
 
 - Role: incident investigation agent; collect evidence with tools before concluding.
 - Never invent evidence. A fact not returned by a tool is not evidence.
@@ -487,9 +525,10 @@ interface Tool<I = unknown, O extends JsonValue = JsonValue> {
 }
 
 type ToolContext = { runId: string; signal: AbortSignal; now: () => number };
+// Python: frozen dataclass with run_id and now ONLY - the signal field is removed (A.3 item 2)
 ```
 
-> **Contract clause — JSON-safe output.** `O extends JsonValue` is load-bearing, not decoration. Without it a tool could declare `outputSchema: z.object({ at: z.date() })`, pass output validation, and hand a `Date` to `ToolOutcome.data` — which is typed `JsonValue`. The trace, the evidence ledger, and the JSONL export all inherit that value, so "JSON-safe by construction" would have been true of `RunState` but false of the tool-result pipeline feeding it. The constraint makes the type system enforce what §3.5 claims.
+> **Contract clause — JSON-safe output.** The sketch above shows the v3.1 TypeScript constraint, which rejected a non-JSON output at compile time. **The Python materialization enforces this differently and provides a different guarantee** (§A.3 item 1): output schemas are Pydantic models and the execution boundary serializes with `model_dump(mode="json")`, so a `datetime` is *normalized to an ISO string* rather than rejected. Nothing non-JSON-safe can reach the trace, evidence ledger, or export — but a tool returning the wrong type is silently converted rather than caught. Both halves belong in `SUBMISSION.md`.
 
 > **Contract clause — statelessness.** Tool implementations MUST be stateless. Per-run state belongs in `ToolContext` or `RunState`. No type system enforces this; it is a documented requirement, and it is what makes the concurrency claim in §17 true. Immutable configuration fixed at construction time (for example a failure-injection setting) satisfies the clause — what it forbids is mutable state that changes across calls or leaks between runs.
 
@@ -517,7 +556,7 @@ async function executeToolCall(
   call: { tool: string; args: JsonObject },
   unavailable: Record<string, WithdrawalReason>,
   ctx: Omit<ToolContext, 'signal'>,
-  runSignal: AbortSignal,
+  runSignal: AbortSignal,     // Python: replaced by the Deadline value (A.3 item 2)
   timeoutMs: number,
 ): Promise<ToolOutcome>
 ```
@@ -570,39 +609,58 @@ class DeadlineExceeded extends Error { cause: DeadlineCause }
 async function withDeadline<T>(
   work: Promise<T>, timerMs: number, runSignal: AbortSignal,
 ): Promise<T>   // throws DeadlineExceeded carrying which source fired
+// Python: async def with_deadline(coro, timeout_ms, deadline) - a Deadline value,
+//         not a signal; classification decided before awaiting (A.3 item 3a)
 ```
 
-Implementation contract — all four are required, and v2 specified none of them:
+Implementation contract. **In the Python materialization (§A.3) the first three collapse into `asyncio.timeout()`** — they are recorded here because they document what the mechanism must guarantee, not because Python code must implement them by hand:
 
-1. **Attach a no-op catch to the loser immediately.** `work.catch(() => {})` is registered before the race. Without it, a tool that times out and rejects 10 seconds later produces an unhandled rejection that can crash the process.
-2. **Clear the timer in `finally`.** A 5-second tool timeout left registered after a 30 ms success keeps the Node event loop alive; with a 60-second run deadline, `agent run` would appear to hang for a minute after printing its answer.
-3. **`unref()` the run-level deadline timer** so it can never hold the process open by itself.
-4. **Classify which source fired, with a fixed precedence.**
+1. ~~Attach a no-op catch to the loser.~~ Unnecessary: the losing task is **cancelled**, not orphaned, so there is no late rejection to swallow.
+2. ~~Clear the timer in `finally`.~~ Unnecessary: the context manager owns its timer.
+3. ~~Detach the run-level timer.~~ Unnecessary: there is no raw timer that could hold the process open.
+4. **Classify which source fired, with a fixed precedence.** This one remains fully load-bearing — see below and §A.3 item 3a.
+
+A fifth requirement is specific to Python and is not optional: **no handler in the deadline path may catch `BaseException`.** `CancelledError` derives from it, and catching it would convert an external shutdown into a tool timeout.
 
 ### Precedence rule
 
-There are three ways a raced call ends: the work settles, the per-call timer expires, or the run-wide signal aborts. When more than one is eligible, the rule is total and unconditional:
+A bounded call ends one of two ways: the work completes, or the timeout fires. When it fires, **two different clocks could have been responsible**, and they mean opposite things about the tool. The rule is total and unconditional:
 
 > **The run deadline always takes precedence over a per-call timer.**
-> If `runSignal.aborted` is true at the moment the race resolves, the cause is `run_deadline` regardless of which timer technically fired first.
+> Exact equality resolves to `run_deadline`.
 
-Checking the signal's state rather than racing two timers removes the tie entirely — there is no interleaving in which the answer depends on event-loop ordering.
+**Decided before awaiting, not after** (§A.3 item 3a). Both durations are known at dispatch, so the binding limit is computed up front rather than inferred from a post-timeout clock reading:
+
+```
+   binding_is_run_deadline = remaining_ms <= timeout_ms      # race-free, known before the await
+   caused_by_run_deadline  = binding_is_run_deadline
+                             or clock() >= deadline_at_ms    # secondary: event-loop starvation
+```
+
+An earlier draft classified purely by comparing the clock after the timeout fired. That reintroduced the exact misattribution this rule exists to prevent: with an integer-millisecond clock, a timer firing at 1999.7 ms of a 2000 ms budget reads as `now < deadline_at`, and **a healthy tool takes a strike for the harness's own clock.** Deciding from the binding limit removes the tie entirely — there is no interleaving in which the answer depends on event-loop ordering or clock resolution.
 
 Consequences at each call site:
 
-| Site | `cause: 'timer'` | `cause: 'run_deadline'` |
+| Site | `cause: "timer"` | `cause: "run_deadline"` |
 | --- | --- | --- |
-| `model.propose` | — (the model's only timer *is* the remaining wall clock) | `ModelCallError{kind:'timeout'}` → `wall_clock_limit` |
-| `tool.execute` | `kind:'timeout'`, **penalty applies** | `kind:'timeout'`, `causedByRunDeadline: true`, **no penalty**; the next gate terminates with `wall_clock_limit` |
+| `model.propose` | — (the model's only timer *is* the remaining wall clock) | `ModelCallError(kind="timeout")` → `wall_clock_limit` |
+| `tool.execute` | `kind="timeout"`, **penalty applies** | `kind="timeout"`, `caused_by_run_deadline=True`, **no penalty**; the next gate terminates with `wall_clock_limit` |
 
-The worked example: a tool starting at 58.9 s under a 60 s run deadline and a 5 s tool timeout is bounded at 1.1 s by `min(toolTimeoutMs, remainingMs)`. That abort is the run clock's doing, so the tool takes no strike, the trace says `causedByRunDeadline`, and the run terminates as `wall_clock_limit` — not as a tool failure.
+The worked example: a tool starting at 58.9 s under a 60 s run deadline and a 5 s tool timeout is bounded at 1.1 s. Because `remaining_ms (1100) <= timeout_ms (5000)`, the binding limit is the run deadline — determined *before* the await, not guessed afterwards. The tool takes no strike, the trace records `caused_by_run_deadline`, and the run terminates as `wall_clock_limit` rather than as a tool failure.
 
-Used in exactly two places: `model.propose` (raced against remaining wall clock) and `tool.execute` (raced against `min(toolTimeoutMs, remainingMs)`).
+Used in exactly two places: `model.propose` and `tool.execute`.
 
-**Abandoned execution — the honest statement.** `Promise.race` bounds *the harness*, not the tool. A tool that ignores its `AbortSignal` and never settles is **abandoned**, not killed; in-process JavaScript cannot forcibly terminate a promise. Two consequences, both stated in `SUBMISSION.md` rather than glossed:
+**Interrupted execution — the honest statement, in its Python form.** This paragraph originally described JavaScript's weaker behaviour (a raced promise is *abandoned*, never notified). The Python materialization is stronger, and the claim must be stated at its actual strength — neither the old weaker version nor an overclaim:
 
-- The loop is **logically** sequential; after a timeout, abandoned work may still be running while the next call proceeds. Safe here because all four tools are pure fixture reads with no side effects — a prototype assumption, not a general guarantee.
-- True termination requires a worker thread or subprocess boundary (§17). Withdrawing a tool on its *first* timeout was considered and rejected: it would withdraw a healthy-but-briefly-slow tool on one blip and contradicts the consecutive-failure policy in §8.3.
+> `asyncio.timeout()` cancels the awaited task, and the coroutine observes `CancelledError` at its next await point. **No separately composed abort signal is required** to make an ordinary awaiting coroutine cancellable, which is the meaningful improvement over the JavaScript mechanism. Cancellation is nonetheless still *cooperative*: it does not interrupt blocking synchronous work, and code that suppresses `CancelledError` defeats it.
+
+Three consequences, all stated in `SUBMISSION.md` rather than glossed:
+
+- A tool doing **blocking synchronous work** is not interrupted, and the loop keeps waiting for the thread to return. True preemption requires a worker thread or subprocess boundary (§17). This is why the four synthetic tools are pure `async` fixture reads.
+- The loop is **logically** sequential. In the JavaScript materialization, abandoned work could still be running while the next call proceeds; under asyncio a cancelled coroutine is torn down at its next await, so the overlap window is bounded rather than open-ended — but it is not zero for a tool that ignores cancellation.
+- Withdrawing a tool on its *first* timeout was considered and rejected: it would withdraw a healthy-but-briefly-slow tool on one blip and contradicts the consecutive-failure policy in §8.3.
+
+**Never write "genuine rather than cooperative."** The defensible contrast is *default-cancel versus default-abandon*, not preemptive versus cooperative (§A.3 item 2).
 
 ---
 
@@ -614,7 +672,7 @@ Used in exactly two places: `model.propose` (raced against remaining wall clock)
 async function run(objective, deps): Promise<RunResult>
 
   state     = initState(objective, ids.next(), clock.now())
-  deadline  = makeDeadline(state.startedAtMs, limits.maxWallClockMs)   // unref'd timer
+  deadline  = make_deadline(state.started_at_ms, limits.max_wall_clock_ms)
   runSignal = deadline.signal
 
   trace.record({ type:'run_started', objective, limits, catalog: registry.names(),
@@ -653,7 +711,7 @@ async function run(objective, deps): Promise<RunResult>
 
     state.step++
 
-    parsed = ModelDecisionSchema.safeParse(response.decision)   // ONLY the decision is untrusted
+    parsed = validate(response.decision)      # ONLY the decision is untrusted
     if (!parsed.success) {
       trace.record({ type:'model_decision_rejected', reason:'schema', issues: parsed.error.issues })
       if (!bumpProtocolViolation(state, limits)) { terminate(state,'model_protocol_violation'); break RUN }
@@ -770,9 +828,9 @@ finalize(state, events) →
 
 ### 6.4 Error boundary
 
-The loop converts **expected** runtime failures — model errors, tool errors, schema failures, deadline expiry — into structured outcomes. It does **not** claim nothing can escape: a defect in `structuredClone`, redaction, or a renderer would still throw.
+The loop converts **expected** runtime failures — model errors, tool errors, schema failures, deadline expiry — into structured outcomes. It does **not** claim nothing can escape: a defect in `deepcopy`, redaction, or a renderer would still throw.
 
-The outermost boundary lives in `cli/main.ts` **only**: an unexpected throw is reported with its stack and exits `2`. The loop stays unwrapped, because a blanket `try/catch` there would convert genuine bugs into plausible-looking degraded runs — the opposite of observability.
+The outermost boundary lives in `cli/main.py` **only**: an unexpected throw is reported with its stack and exits `2`. The loop stays unwrapped, because a blanket `try/catch` there would convert genuine bugs into plausible-looking degraded runs — the opposite of observability.
 
 ---
 
@@ -782,11 +840,13 @@ The outermost boundary lives in `cli/main.ts` **only**: an unexpected throw is r
 
 | Layer | Catches | Mechanism |
 | --- | --- | --- |
-| Gates | Counted overruns *between* calls | `budget.check()` before every model call and every dispatch |
-| Race | Elapsed overruns *during* a call | `withDeadline()` on `propose` and `execute` |
-| Signal | Cooperative cancellation | `AbortSignal` forwarded to `fetch` and to tools |
+| Gates | Counted overruns *between* calls | `check()` before every model call and every dispatch |
+| Timeout | Elapsed overruns *during* a call | `with_deadline()` wrapping `propose` and `execute` |
+| Cancellation | Delivery of the interruption into the awaiting coroutine | `asyncio` task cancellation — automatic, no signal to forward |
 
-Each catches what the others cannot. v2's `maxWallClockMs` had only the first, so a model call starting at 59.9 s could run 90 s more unchecked.
+Each catches what the others cannot. v2's wall-clock limit had only the first, so a model call starting at 59.9 s could run 90 s more unchecked.
+
+The third layer reads differently in Python than in the original TypeScript sketch. There is **no signal to compose or forward**: `asyncio.timeout()` cancels the awaited task directly, and both the SDK's HTTP call and an ordinary tool coroutine observe `CancelledError` at their next await point without any opt-in from the author (§A.3 item 2).
 
 ### 7.2 Limits
 
@@ -1003,7 +1063,7 @@ Operational events only, plus an optional model-supplied `note` capped at 200 ch
 `recorder.record()` performs, in order:
 
 ```
-structuredClone(event)   →  no shared references with live objects
+deepcopy(event)          →  no shared references with live objects
 redact(snapshot)         →  §10.4
 truncate(snapshot)       →  §11.2
 assign seq, ts, runId    →  monotonic, injected clock
@@ -1066,7 +1126,13 @@ Payloads exceeding `maxTracePayloadBytes` (64 000) are truncated and marked:
 
 `EvidenceRecord.truncated` propagates the marker so a reviewer can distinguish lossy evidence from complete evidence.
 
-> **Precise claim:** this bounds the **recorded trace payload size**, not peak memory. `structuredClone` runs before truncation, so a 10 MB tool output is still fully materialised and copied once before being reduced. Truncating before cloning was considered and rejected as an optimization for a condition the synthetic fixtures — three orders of magnitude below the cap — cannot produce. The cap exists so the failure mode is bounded and visible rather than absent by luck.
+> **Precise claim, in three parts — state all three:**
+>
+> 1. This bounds the **size of each recorded payload after serialization**. The cap and the preview are both measured in **UTF-8 bytes**, and the preview is byte-sliced then decoded with `errors="ignore"` so multibyte text cannot be split into invalid UTF-8.
+> 2. It does **not** bound peak memory. `deepcopy` runs before truncation, so a 10 MB tool output is fully materialised and copied once before being reduced. Truncating before cloning was considered and rejected as an optimization for a condition the synthetic fixtures — three orders of magnitude below the cap — cannot produce.
+> 3. It does **not** bound the size of the trace as a whole. Total trace size is bounded only *indirectly*, by the step and tool-call limits capping how many events a run can emit. "The trace is size-bounded" on its own is an overclaim.
+>
+> The cap exists so the per-payload failure mode is bounded and visible rather than absent by luck.
 
 ---
 
@@ -1103,7 +1169,7 @@ Shrinking the action space beats punishing the model for using it: a provider wi
 | Tools | `Tool[]` | Fakes with controllable outcomes | Fixture coupling |
 | Clock | `{ now(): number }` | Advanceable fake | Timestamp drift |
 | IDs | `{ next(): string }` | Counter → `run_1`, `call_1` | UUID non-determinism |
-| Network | Confined to `model/anthropic.ts` | Never constructed in tests | All external I/O |
+| Network | Confined to `model/anthropic_adapter.py` | Never constructed in tests | All external I/O |
 
 **Timing strategy, explicitly** — v2 claimed "no real timers" without saying how, and the v3 answer (fake timers) was specific to JavaScript. The Python answer is simpler (§A.3 item 3):
 
@@ -1278,9 +1344,9 @@ v2's `--script happy|degraded|runaway` is removed: `--fail-tool` and `--max-step
 | Trace | recorder → array → stdout/file | The recorder **can later fan out** to a sink interface; no such abstraction exists today |
 | Run state | In-memory `RunState` | Checkpointed after each turn |
 | Clock / IDs | Injected | Injected (IDs become ULIDs for global ordering) |
-| Deadline | `AbortSignal` in-process | Same signal plus a server-side deadline |
+| Deadline | `asyncio.timeout()` in-process | Same, plus a server-side deadline |
 
-**Unchanged:** `agent/loop.ts`, `budget.ts`, `policy.ts`, `result.ts`, `instructions.ts`, `ModelDecisionSchema`. **The control loop file does not change at all** — the actual argument for every boundary in this design.
+**Unchanged:** `agent/loop.py`, `budget.py`, `policy.py`, `result.py`, `instructions.py`, and the decision models. **The control loop file does not change at all** — the actual argument for every boundary in this design.
 
 **Checkpointing:** `RunState` is JSON-safe by construction (§3.1, §3.5). Persist after each iteration alongside appended trace events; resume by rehydrating and continuing. Evidence needs no separate persistence because it derives from stored events.
 
@@ -1408,12 +1474,12 @@ Pull back if any appear: a generic node/edge graph · middleware/hooks/intercept
 
 | AC | Design element | Location | Test | Demo evidence |
 | --- | --- | --- | --- | --- |
-| **AC1** Appropriate tool selection | Catalog from Zod → JSON Schema; batch name pre-validation; per-call input validation with structured `issues` returned | `tools/registry.ts`, `agent/loop.ts` §6.2, `tools/execute.ts` | 3, 4, 11, 16 | `agent tools` shows the catalog; happy run shows `tool_call_started{get_service_status,{service:"checkout-api"}}` → E1; real-model run shows genuine selection |
-| **AC2** Multi-step investigation | Loop re-projects after every result; `calls[]` with an independence contract; evidence accumulates | `agent/loop.ts`, `agent/state.ts` | 12 | Happy run: 4 calls across turns; findings cite E1–E4 |
-| **AC3** Observable trace | Single append-only log; monotonic `seq`; cloned immutable snapshots; typed union; two renderers | `trace/recorder.ts`, `cli/render.ts` | 26, **28, 29 golden** | Pretty trace on screen; `--trace out.jsonl` showing the same ordered stream |
-| **AC4** Tool failure | 5-kind taxonomy; asymmetric input/output policy; hard deadline race; consecutive-failure withdrawal; catalog shrink; batch pre-validation | `tools/execute.ts`, `agent/policy.ts`, `agent/loop.ts` | 5–9, 13–17 | Degraded run: 2 `tool_error` → `tool_withdrawn` → `toolsOffered` shrinks → answer with GAPS OBSERVED |
-| **AC5** Execution limit | Gate 1, Gate 2, `withDeadline` under both; `finalize()` provably pure | `agent/loop.ts`, `agent/budget.ts`, `agent/result.ts` | **18** (exact counts), 10 | Limit run: `budget_exhausted{at:"pre_model"}` is the last event before `run_finished`; zero subsequent model/tool events |
-| **AC6** Evidence vs. conclusions | `findings[]` each requiring ≥1 citation; `conclusion` structurally separate with optional validated citations; `sufficiency`; ledger validation; GAPS split by provenance | `model/types.ts`, `agent/result.ts`, `cli/render.ts` | 19–23 | FINDINGS (cited) / CONCLUSION (labelled inference) / EVIDENCE / GAPS OBSERVED vs REPORTED |
+| **AC1** Appropriate tool selection | Catalog from Zod → JSON Schema; batch name pre-validation; per-call input validation with structured `issues` returned | `tools/registry.py`, `agent/loop.py` §6.2, `tools/execute.py` | 3, 4, 11, 16 | `agent tools` shows the catalog; happy run shows `tool_call_started{get_service_status,{service:"checkout-api"}}` → E1; real-model run shows genuine selection |
+| **AC2** Multi-step investigation | Loop re-projects after every result; `calls[]` with an independence contract; evidence accumulates | `agent/loop.py`, `agent/state.py` | 12 | Happy run: 4 calls across turns; findings cite E1–E4 |
+| **AC3** Observable trace | Single append-only log; monotonic `seq`; cloned immutable snapshots; typed union; two renderers | `trace/recorder.py`, `cli/render.py` | 26, **28, 29 golden** | Pretty trace on screen; `--trace out.jsonl` showing the same ordered stream |
+| **AC4** Tool failure | 5-kind taxonomy; asymmetric input/output policy; hard deadline race; consecutive-failure withdrawal; catalog shrink; batch pre-validation | `tools/execute.py`, `agent/policy.py`, `agent/loop.py` | 5–9, 13–17 | Degraded run: 2 `tool_error` → `tool_withdrawn` → `toolsOffered` shrinks → answer with GAPS OBSERVED |
+| **AC5** Execution limit | Gate 1, Gate 2, `withDeadline` under both; `finalize()` provably pure | `agent/loop.py`, `agent/budget.py`, `agent/result.py` | **18** (exact counts), 10 | Limit run: `budget_exhausted{at:"pre_model"}` is the last event before `run_finished`; zero subsequent model/tool events |
+| **AC6** Evidence vs. conclusions | `findings[]` each requiring ≥1 citation; `conclusion` structurally separate with optional validated citations; `sufficiency`; ledger validation; GAPS split by provenance | `model/contracts.py`, `agent/result.py`, `cli/render.py` | 19–23 | FINDINGS (cited) / CONCLUSION (labelled inference) / EVIDENCE / GAPS OBSERVED vs REPORTED |
 
 ---
 
@@ -1422,7 +1488,7 @@ Pull back if any appear: a generic node/edge graph · middleware/hooks/intercept
 ### What changed from v2
 
 1. **`toModelTurn()` is now the single path for every tool-derived turn** — v2 pushed `tool_result` inline, leaking unredacted summaries to the model.
-2. **`withDeadline()` helper** with three mandatory correctness properties: loser-rejection catch, `clearTimeout` in `finally`, `unref` on the run deadline.
+2. **`with_deadline()` helper** bounding every external call. In the Python materialization its first three v3 requirements collapse into `asyncio.timeout()`; the classification requirement remains load-bearing (§A.3 item 3a).
 3. **`summarize()` wrapped and clamped** at 500 chars — the bound is now mechanical.
 4. **Batch name pre-validation** — a decision containing an unknown tool executes zero calls.
 5. **`unknown_tool` removed from `ToolErrorKind`** and reclassified as a decision-level protocol fault.
@@ -1433,7 +1499,7 @@ Pull back if any appear: a generic node/edge graph · middleware/hooks/intercept
 10. **`agent tools` command** added for demo checklist item 1.
 11. **Empty-catalog handling** in the Anthropic adapter.
 12. **Token `usage` recorded** in `model_decision`.
-13. **Vitest fake timers** specified for deadline tests.
+13. **Deadline test strategy specified** — injected small timeouts against real `asyncio`, no fake-timer library (§A.3 item 3).
 14. **CLI-only error boundary**; the loop stays unwrapped.
 15. **`AnthropicModel` promoted** from optional to core deliverable; one real-model run enters the demo.
 16. **`--script` flag removed**; `budget.check()` signature unified.
@@ -1441,7 +1507,7 @@ Pull back if any appear: a generic node/edge graph · middleware/hooks/intercept
 ### What changed in v3.1
 
 17. **Deadline precedence rule** — the run deadline always outranks a per-call timer, decided by `runSignal.aborted` rather than by timer ordering. A tool aborted by the run clock carries `causedByRunDeadline` and **takes no failure penalty**, closing a path where the harness's own clock could withdraw a healthy tool.
-18. **`Tool<I, O extends JsonValue>`** — the output type is now constrained, making the JSON-safety guarantee real across the tool-result → trace → evidence pipeline rather than only for `RunState`.
+18. **Tool output JSON-safety made explicit** — enforced in Python by Pydantic serialization at the execution boundary, which normalizes rather than rejects (§A.3 item 1).
 19. **`ModelResponse = { decision: unknown; usage?: ModelUsage }`** — a typed envelope with exactly one untrusted field, replacing v3's untyped `usage` extraction.
 20. **`maxModelRetries` documented as a run-wide budget**; **`maxToolCalls` redescribed** as tool-dispatch attempts including rejected ones.
 21. **Decision non-atomicity stated explicitly** — name validation is the only all-or-nothing gate.
@@ -1484,7 +1550,7 @@ Pull back if any appear: a generic node/edge graph · middleware/hooks/intercept
 8. Every expected runtime failure becomes a structured `RunResult` with a termination reason; collected evidence is never discarded.
 9. A tool failing twice consecutively **through its own fault** is removed from the model's catalog for the remainder of the run. Model errors (`invalid_arguments`) and harness errors (run-deadline aborts) never count against a tool.
 10. `RunState` is JSON-serializable, so checkpoint and resume require no changes to the loop.
-11. Every value reaching the trace or the model is JSON-safe by type, not by convention — `Tool<I, O extends JsonValue>` enforces it at the source.
+11. Every value reaching the trace or the model is JSON-safe, enforced by Pydantic serialization at the execution boundary — by normalization, not by rejection (§A.3 item 1).
 12. Exactly one field crossing the model boundary is untrusted (`ModelResponse.decision`); everything else in the envelope is typed.
 
 ### What it explicitly does NOT guarantee
