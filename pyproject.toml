@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "durable-reminders"
+version = "0.1.0"
+description = "Durable reminders and scheduled follow-ups that stay correct across restarts, retries, edits and cancellation"
+requires-python = ">=3.12"
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+#
+# Deliberately minimal. A dependency is added in the phase whose failure mode
+# requires it (BUILD_PLAN R1), not in advance. Today that is exactly one.
+#
+# tzdata: NOT optional, and not a convenience.
+#   `zoneinfo` falls back to the operating system's tz database when the
+#   `tzdata` package is absent. Windows has no OS tz database at all, and slim
+#   containers usually ship without one, so `ZoneInfo("America/New_York")`
+#   raises ZoneInfoNotFoundError on a reviewer's machine and not on the
+#   author's. This is ANALYSIS failure mode 24, and it is the reason the
+#   package is pinned here rather than assumed.
+#   See src/reminders/preflight.py for the boot-time check that proves it.
+# ---------------------------------------------------------------------------
+dependencies = [
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "mypy>=1.13",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reminders"]
+
+# ---------------------------------------------------------------------------
+# pytest
+#
+# asyncio_mode = "auto" means an `async def test_...` needs no decorator. This
+# matters more than it looks: the alternative is a per-test marker that is easy
+# to forget, and a forgotten marker makes an async test silently pass without
+# ever awaiting anything.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+
+# ---------------------------------------------------------------------------
+# mypy
+#
+# strict, over src AND tests. Tests are held to the same bar as production code
+# because a test that type-checks loosely can assert the wrong thing quietly.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+# The design documents contain Python blocks that are illustrative, deliberately
+# aligned for reading, and in places not valid standalone code. They are prose,
+# not source, and the formatter must leave them alone.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "TID",  # tidy imports -- carries the banned-api rule below
+]
+
+# ---------------------------------------------------------------------------
+# The real-time ban (BUILD_PLAN P0.2.4)
+#
+# Anything that reads the wall clock or waits on it is forbidden outside
+# adapters/clock_system.py. Everything else takes a `Clock` as a parameter.
+#
+# This is not a style preference. One `asyncio.sleep` on a scheduling path
+# makes that path untestable without waiting real seconds; one `datetime.now()`
+# makes a daylight-saving bug in March unreproducible in January.
+#
+# This lint rule is the FIRST line of defence, not the only one: `# noqa` can
+# silence it. tests/unit/test_no_real_time.py parses the syntax tree instead,
+# and that is the mechanism of record.
+# ---------------------------------------------------------------------------
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio.sleep".msg = "Use Clock.sleep(). Real sleeps make scheduling untestable."
+"asyncio.timeout".msg = "Measured by the event loop's own clock, so a deadline set with it lives in a second time domain invisible to the injected clock. Race the send against Clock.sleep() instead (ARCHITECTURE 0.1)."
+"time.sleep".msg = "Use Clock.sleep(). Also blocks the event loop."
+"datetime.datetime.now".msg = "Use Clock.now()."
+"datetime.datetime.utcnow".msg = "Deprecated, and returns a NAIVE datetime. Use Clock.now()."
+"datetime.date.today".msg = "Use Clock.now()."
+
+[tool.ruff.lint.per-file-ignores]
+# The one file the ban exists to confine. Nothing else may be added here.
+"src/reminders/adapters/clock_system.py" = ["TID251"]
