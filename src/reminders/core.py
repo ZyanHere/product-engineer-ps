@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from reminders.timezones import resolve
+from reminders.timezones import ResolutionClass, resolve
 
 if TYPE_CHECKING:
     from reminders.store import Store
@@ -59,6 +59,14 @@ class Reminder:
     """Where those two land. Aware, always UTC. A computed index, so that
     "is it owed?" stays one cheap comparison."""
 
+    resolution_class: ResolutionClass
+    """Which of the three daylight-saving cases produced `due_at`.
+
+    Stored, not derived. The value of this column is that the system can show
+    it *knew* it was adjusting something, rather than leaving a reviewer to
+    wonder whether the right answer was luck.
+    """
+
     text: str
     done: bool = False
 
@@ -87,8 +95,10 @@ class Reminders:
         Writing first and resolving after would leave a row briefly existing
         with no valid instant.
         """
-        due_at = resolve(local_datetime, iana_zone)
-        return self._store.insert(local_datetime, iana_zone, due_at, text)
+        resolved = resolve(local_datetime, iana_zone)
+        return self._store.insert(
+            local_datetime, iana_zone, resolved.instant, resolved.classification, text
+        )
 
     def tick(self, now: datetime) -> list[Reminder]:
         """Fire everything that is owed at `now` and has not fired yet.

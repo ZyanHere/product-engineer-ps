@@ -24,8 +24,11 @@ NINE_AM = datetime(2026, 3, 9, 9, 0)  # naive: what somebody actually said
 
 def test_the_same_local_time_is_two_different_moments() -> None:
     """Two people say "9am" and mean two different instants. Both are right."""
-    assert resolve(NINE_AM, "America/New_York") == datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
-    assert resolve(NINE_AM, "Asia/Kolkata") == datetime(2026, 3, 9, 3, 30, tzinfo=UTC)
+    ny = resolve(NINE_AM, "America/New_York")
+    kolkata = resolve(NINE_AM, "Asia/Kolkata")
+
+    assert ny.instant == datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
+    assert kolkata.instant == datetime(2026, 3, 9, 3, 30, tzinfo=UTC)
 
 
 def test_the_same_zone_is_two_different_offsets() -> None:
@@ -36,8 +39,8 @@ def test_the_same_zone_is_two_different_offsets() -> None:
     the reminder arrives at ten. Nothing is broken -- the user simply never
     wanted an instant.
     """
-    january = resolve(datetime(2026, 1, 15, 9, 0), "America/New_York")
-    july = resolve(datetime(2026, 7, 15, 9, 0), "America/New_York")
+    january = resolve(datetime(2026, 1, 15, 9, 0), "America/New_York").instant
+    july = resolve(datetime(2026, 7, 15, 9, 0), "America/New_York").instant
 
     assert january.hour == 14  # EST, -05:00
     assert july.hour == 13  # EDT, -04:00
@@ -50,14 +53,14 @@ def test_kolkata_has_no_daylight_saving() -> None:
     never touch a transition -- which would make the Stage 6 tests look like
     they pass when they have not been exercised at all. This pins the fact.
     """
-    january = resolve(datetime(2026, 1, 15, 9, 0), "Asia/Kolkata")
-    july = resolve(datetime(2026, 7, 15, 9, 0), "Asia/Kolkata")
+    january = resolve(datetime(2026, 1, 15, 9, 0), "Asia/Kolkata").instant
+    july = resolve(datetime(2026, 7, 15, 9, 0), "Asia/Kolkata").instant
     assert january.hour == july.hour == 3
     assert january.minute == july.minute == 30
 
 
 def test_the_result_is_always_aware_utc() -> None:
-    assert resolve(NINE_AM, "Asia/Kolkata").tzinfo is UTC
+    assert resolve(NINE_AM, "Asia/Kolkata").instant.tzinfo is UTC
 
 
 def test_resolution_is_pure() -> None:
@@ -152,5 +155,5 @@ def test_a_database_from_an_earlier_stage_says_so(tmp_path: Path) -> None:
     old.commit()
     old.close()
 
-    with pytest.raises(ValueError, match="before Stage 5"):
+    with pytest.raises(ValueError, match="written by an earlier stage"):
         Store.open(db)

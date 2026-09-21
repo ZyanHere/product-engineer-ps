@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from reminders.clock import Clock, FakeClock, SystemClock
 from reminders.core import Reminder, Reminders
@@ -55,8 +56,33 @@ def _format(reminder: Reminder) -> str:
     """Both halves: what was asked for, and where it landed."""
     state = "done" if reminder.done else "waiting"
     asked = f"{reminder.local_datetime.isoformat()} {reminder.iana_zone}"
+    note = "" if reminder.resolution_class == "exact" else f"  [{reminder.resolution_class}]"
     return (
-        f"  {reminder.id}  {state:<7}  {reminder.due_at.isoformat()}   ({asked})  {reminder.text}"
+        f"  {reminder.id}  {state:<7}  {reminder.due_at.isoformat()}"
+        f"   ({asked}){note}  {reminder.text}"
+    )
+
+
+def _adjustment_note(reminder: Reminder) -> str | None:
+    """Tell the user now, not when the reminder turns up an hour off.
+
+    The whole value of storing the classification is that somebody can act on
+    it. Saying it out loud at creation is the cheapest possible way to act.
+    """
+    if reminder.resolution_class == "exact":
+        return None
+
+    asked = reminder.local_datetime
+    landed = reminder.due_at.astimezone(ZoneInfo(reminder.iana_zone)).replace(tzinfo=None)
+
+    if reminder.resolution_class == "gap_shifted":
+        return (
+            f"  note: {asked.time()} does not exist on {asked.date()} in "
+            f"{reminder.iana_zone} - the clocks jump. Scheduled for {landed.time()}."
+        )
+    return (
+        f"  note: {asked.time()} happens twice on {asked.date()} in "
+        f"{reminder.iana_zone} - the clocks go back. Took the first."
     )
 
 
@@ -83,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
 def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
-    print(f"stage 5 - it knows whose 9am you meant.  store: {where}  poll: {poll}s\n")
+    print(f"stage 6 - it knows when 9am is a trick question.  store: {where}  poll: {poll}s\n")
     print(HELP)
 
     while True:
@@ -116,9 +142,11 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                         print("  usage: create <local-time> <zone> <text>")
                         continue
                     when, zone, text = parts
-                    print(
-                        _format(reminders.create(datetime.fromisoformat(when), zone, text.strip()))
-                    )
+                    created = reminders.create(datetime.fromisoformat(when), zone, text.strip())
+                    print(_format(created))
+                    note = _adjustment_note(created)
+                    if note:
+                        print(note)
 
                 case "tick":
                     if not rest:

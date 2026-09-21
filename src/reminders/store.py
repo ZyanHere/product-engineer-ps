@@ -22,12 +22,24 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 from reminders.core import Reminder
+from reminders.timezones import ResolutionClass
 
 __all__ = ["Store"]
 
 IN_MEMORY = ":memory:"
+
+_REQUIRED_COLUMNS = {
+    "id",
+    "local_datetime",
+    "iana_zone",
+    "due_at",
+    "resolution_class",
+    "text",
+    "done",
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reminder (
@@ -40,6 +52,11 @@ CREATE TABLE IF NOT EXISTS reminder (
 
     -- the resolved instant: what "is it owed?" compares against
     due_at         TEXT    NOT NULL,
+
+    -- which daylight-saving case produced it. NOT NULL on purpose: a nullable
+    -- column could be quietly skipped, which is the exact failure this stage
+    -- exists to fix.
+    resolution_class TEXT  NOT NULL,
 
     text           TEXT    NOT NULL,
     done           INTEGER NOT NULL
@@ -67,11 +84,11 @@ class Store:
         # inventing schema-versioning now would be exactly the kind of "we'll
         # need it eventually" that this sequence exists to avoid.
         columns = {row[1] for row in connection.execute("PRAGMA table_info(reminder)")}
-        missing = {"local_datetime", "iana_zone"} - columns
+        missing = _REQUIRED_COLUMNS - columns
         if missing:
             connection.close()
             raise ValueError(
-                f"{path} was written before Stage 5 and has no {sorted(missing)}. "
+                f"{path} was written by an earlier stage and has no {sorted(missing)}. "
                 "Start a fresh database file."
             )
 
@@ -83,7 +100,8 @@ class Store:
     def load_all(self) -> list[Reminder]:
         """Every reminder, in creation order."""
         rows = self._connection.execute(
-            "SELECT id, local_datetime, iana_zone, due_at, text, done FROM reminder ORDER BY id"
+            "SELECT id, local_datetime, iana_zone, due_at, resolution_class, text, done "
+            "FROM reminder ORDER BY id"
         ).fetchall()
         return [_to_reminder(row) for row in rows]
 
@@ -103,14 +121,20 @@ class Store:
         shape, so SQLite's string ordering and chronological ordering agree.
         """
         rows = self._connection.execute(
-            "SELECT id, local_datetime, iana_zone, due_at, text, done FROM reminder "
+            "SELECT id, local_datetime, iana_zone, due_at, resolution_class, text, done "
+            "FROM reminder "
             "WHERE done = 0 AND due_at <= ? ORDER BY due_at, id",
             (now.isoformat(),),
         ).fetchall()
         return [_to_reminder(row) for row in rows]
 
     def insert(
-        self, local_datetime: datetime, iana_zone: str, due_at: datetime, text: str
+        self,
+        local_datetime: datetime,
+        iana_zone: str,
+        due_at: datetime,
+        resolution_class: ResolutionClass,
+        text: str,
     ) -> Reminder:
         """Write a new reminder and return it, with the id the database gave it.
 
@@ -124,9 +148,16 @@ class Store:
         everything already on disk.
         """
         cursor = self._connection.execute(
-            "INSERT INTO reminder (local_datetime, iana_zone, due_at, text, done) "
-            "VALUES (?, ?, ?, ?, 0)",
-            (local_datetime.isoformat(), iana_zone, due_at.isoformat(), text),
+            "INSERT INTO reminder "
+            "(local_datetime, iana_zone, due_at, resolution_class, text, done) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (
+                local_datetime.isoformat(),
+                iana_zone,
+                due_at.isoformat(),
+                resolution_class,
+                text,
+            ),
         )
         self._connection.commit()
         return Reminder(
@@ -134,6 +165,7 @@ class Store:
             local_datetime=local_datetime,
             iana_zone=iana_zone,
             due_at=due_at,
+            resolution_class=resolution_class,
             text=text,
         )
 
@@ -150,6 +182,7 @@ def _to_reminder(row: tuple[object, ...]) -> Reminder:
         local_datetime=datetime.fromisoformat(str(row[1])),
         iana_zone=str(row[2]),
         due_at=datetime.fromisoformat(str(row[3])),
-        text=str(row[4]),
-        done=bool(row[5]),
+        resolution_class=cast("ResolutionClass", str(row[4])),
+        text=str(row[5]),
+        done=bool(row[6]),
     )
