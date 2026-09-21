@@ -21,9 +21,19 @@ from reminders.store import Store
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
 
 
+def naive(instant: datetime) -> datetime:
+    """The same wall time, with the offset stripped.
+
+    Since Stage 5, `create` takes what the user *said* plus a zone rather than
+    an instant somebody worked out. These tests are not about zones, so they
+    say it in UTC -- which resolves to exactly the instants they always used.
+    """
+    return instant.replace(tzinfo=None)
+
+
 def test_does_not_fire_before_its_time() -> None:
     reminders = Reminders(Store.open())
-    reminders.create(DUE_AT, "Call the clinic")
+    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     assert reminders.tick(DUE_AT - timedelta(minutes=1)) == []
 
@@ -38,7 +48,7 @@ def test_fires_at_its_time() -> None:
     """
     store = Store.open()
     reminders = Reminders(store)
-    created = reminders.create(DUE_AT, "Call the clinic")
+    created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     fired = reminders.tick(DUE_AT)
 
@@ -53,7 +63,7 @@ def test_fires_exactly_once() -> None:
     a busy loop that looks like healthy operation.
     """
     reminders = Reminders(Store.open())
-    reminders.create(DUE_AT, "Call the clinic")
+    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     assert len(reminders.tick(DUE_AT)) == 1
     assert reminders.tick(DUE_AT + timedelta(days=30)) == []
@@ -67,16 +77,16 @@ def test_an_overdue_reminder_still_fires() -> None:
     Stage 4's problem is about a query window rather than about this.
     """
     reminders = Reminders(Store.open())
-    reminders.create(DUE_AT, "Call the clinic")
+    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     assert len(reminders.tick(DUE_AT + timedelta(hours=6))) == 1
 
 
 def test_fires_in_due_order() -> None:
     reminders = Reminders(Store.open())
-    reminders.create(DUE_AT + timedelta(hours=2), "third")
-    reminders.create(DUE_AT, "first")
-    reminders.create(DUE_AT + timedelta(hours=1), "second")
+    reminders.create(naive(DUE_AT + timedelta(hours=2)), "UTC", "third")
+    reminders.create(naive(DUE_AT), "UTC", "first")
+    reminders.create(naive(DUE_AT + timedelta(hours=1)), "UTC", "second")
 
     fired = reminders.tick(DUE_AT + timedelta(hours=3))
 

@@ -2,7 +2,7 @@
 
     python -m reminders --db reminders.db --now 2026-03-09T12:00:00Z
 
-    > create 2026-03-09T13:00:00Z Call the clinic
+    > create 2026-03-09T09:00 America/New_York Call the clinic
     > now
       2026-03-09T12:00:00+00:00
     > run 2026-03-09T14:00:00Z
@@ -35,7 +35,8 @@ from reminders.store import IN_MEMORY, Store
 __all__ = ["main"]
 
 HELP = """commands:
-  create <utc-instant> <text>   schedule a reminder
+  create <local-time> <zone> <text>
+                                e.g. create 2026-03-09T09:00 America/New_York Call the clinic
   now                           what the clock says
   tick <utc-instant>            set the clock there, fire anything owed
   run <utc-instant>             let the loop run until then
@@ -51,8 +52,12 @@ def _parse_instant(raw: str) -> datetime:
 
 
 def _format(reminder: Reminder) -> str:
+    """Both halves: what was asked for, and where it landed."""
     state = "done" if reminder.done else "waiting"
-    return f"  {reminder.id}  {state:<7}  {reminder.due_at.isoformat()}  {reminder.text}"
+    asked = f"{reminder.local_datetime.isoformat()} {reminder.iana_zone}"
+    return (
+        f"  {reminder.id}  {state:<7}  {reminder.due_at.isoformat()}   ({asked})  {reminder.text}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
 def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
-    print(f"stage 4 - it fires on its own.  store: {where}  poll: {poll}s\n")
+    print(f"stage 5 - it knows whose 9am you meant.  store: {where}  poll: {poll}s\n")
     print(HELP)
 
     while True:
@@ -106,11 +111,14 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                     print(f"  {clock.now().isoformat()}")
 
                 case "create":
-                    when, _, text = rest.partition(" ")
-                    if not when or not text.strip():
-                        print("  usage: create <utc-instant> <text>")
+                    parts = rest.split(" ", 2)
+                    if len(parts) < 3 or not parts[2].strip():
+                        print("  usage: create <local-time> <zone> <text>")
                         continue
-                    print(_format(reminders.create(_parse_instant(when), text.strip())))
+                    when, zone, text = parts
+                    print(
+                        _format(reminders.create(datetime.fromisoformat(when), zone, text.strip()))
+                    )
 
                 case "tick":
                     if not rest:

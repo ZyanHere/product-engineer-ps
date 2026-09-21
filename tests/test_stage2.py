@@ -21,12 +21,22 @@ from reminders.store import Store
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
 
 
+def naive(instant: datetime) -> datetime:
+    """The same wall time, with the offset stripped.
+
+    Since Stage 5, `create` takes what the user *said* plus a zone rather than
+    an instant somebody worked out. These tests are not about zones, so they
+    say it in UTC -- which resolves to exactly the instants they always used.
+    """
+    return instant.replace(tzinfo=None)
+
+
 def test_a_reminder_survives_a_restart(tmp_path: Path) -> None:
     """The Stage 1 failure, now fixed."""
     db = tmp_path / "r.db"
 
     first = Store.open(db)
-    Reminders(first).create(DUE_AT, "Call the clinic")
+    Reminders(first).create(naive(DUE_AT), "UTC", "Call the clinic")
     first.close()
 
     # Nothing from the first program survives except the file.
@@ -44,7 +54,7 @@ def test_it_still_fires_after_a_restart(tmp_path: Path) -> None:
     db = tmp_path / "r.db"
 
     first = Store.open(db)
-    Reminders(first).create(DUE_AT, "Call the clinic")
+    Reminders(first).create(naive(DUE_AT), "UTC", "Call the clinic")
     first.close()
 
     second = Store.open(db)
@@ -67,7 +77,7 @@ def test_it_does_not_fire_twice_across_a_restart(tmp_path: Path) -> None:
 
     first = Store.open(db)
     assert len(Reminders(first).tick(DUE_AT)) == 0  # nothing yet
-    Reminders(first).create(DUE_AT, "Call the clinic")
+    Reminders(first).create(naive(DUE_AT), "UTC", "Call the clinic")
     fired_before = Reminders(first).tick(DUE_AT)
     first.close()
 
@@ -92,7 +102,7 @@ def test_creation_is_committed_before_it_returns(tmp_path: Path) -> None:
 
     writer = Store.open(db)
     try:
-        Reminders(writer).create(DUE_AT, "Call the clinic")
+        Reminders(writer).create(naive(DUE_AT), "UTC", "Call the clinic")
 
         onlooker = Store.open(db)
         try:
@@ -113,12 +123,12 @@ def test_ids_do_not_restart_from_one(tmp_path: Path) -> None:
     db = tmp_path / "r.db"
 
     first = Store.open(db)
-    a = Reminders(first).create(DUE_AT, "first")
+    a = Reminders(first).create(naive(DUE_AT), "UTC", "first")
     first.close()
 
     second = Store.open(db)
     try:
-        b = Reminders(second).create(DUE_AT, "second")
+        b = Reminders(second).create(naive(DUE_AT), "UTC", "second")
         assert b.id != a.id
     finally:
         second.close()

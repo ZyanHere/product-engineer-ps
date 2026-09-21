@@ -11,17 +11,19 @@ requires-python = ">=3.12"
 # ---------------------------------------------------------------------------
 # Runtime dependencies
 #
-# None yet, and that is the point. A dependency is added at the stage whose
-# failure requires it (STAGES.md, rule 1) -- never in advance.
+# One, added at the stage that needed it (STAGES.md, rule 1).
 #
-# Coming, and when:
-#   Stage 5   tzdata   -- the moment local time and zones exist. `zoneinfo`
-#                         borrows the operating system's tz database, and
-#                         Windows has none at all, so it must be declared
-#                         rather than assumed (ANALYSIS failure mode 24).
+# tzdata (Stage 5): `zoneinfo` ships no data of its own -- it borrows the
+#   operating system's time-zone database. Windows has none at all, and slim
+#   containers usually ship without one, so `ZoneInfo("America/New_York")`
+#   raises on somebody else's machine and not on yours. Declared, not assumed.
+#
+# Coming later:
 #   Stage 16  fastapi, pydantic -- when something other than a CLI calls this.
 # ---------------------------------------------------------------------------
-dependencies = []
+dependencies = [
+    "tzdata>=2024.1",
+]
 
 [project.optional-dependencies]
 dev = [

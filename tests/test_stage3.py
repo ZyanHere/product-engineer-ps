@@ -19,6 +19,16 @@ from reminders.store import Store
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
 
 
+def naive(instant: datetime) -> datetime:
+    """The same wall time, with the offset stripped.
+
+    Since Stage 5, `create` takes what the user *said* plus a zone rather than
+    an instant somebody worked out. These tests are not about zones, so they
+    say it in UTC -- which resolves to exactly the instants they always used.
+    """
+    return instant.replace(tzinfo=None)
+
+
 def test_a_reminder_created_elsewhere_is_seen(tmp_path: Path) -> None:
     """The Stage 2 failure, now fixed.
 
@@ -30,7 +40,7 @@ def test_a_reminder_created_elsewhere_is_seen(tmp_path: Path) -> None:
     try:
         a, b = Reminders(a_store), Reminders(b_store)
 
-        b.create(DUE_AT, "Call the clinic")
+        b.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         assert len(a.all()) == 1, "A is still reading a snapshot"
         assert [r.text for r in a.tick(DUE_AT)] == ["Call the clinic"]
@@ -50,7 +60,7 @@ def test_nothing_about_the_schedule_lives_in_memory(tmp_path: Path) -> None:
     db = tmp_path / "r.db"
     store = Store.open(db)
     try:
-        Reminders(store).create(DUE_AT, "Call the clinic")
+        Reminders(store).create(naive(DUE_AT), "UTC", "Call the clinic")
 
         # Throw the object away and build another one. Same store, no state.
         assert len(Reminders(store).tick(DUE_AT)) == 1
@@ -65,7 +75,7 @@ def test_ticking_twice_with_nothing_due_does_nothing(tmp_path: Path) -> None:
     store = Store.open(db)
     try:
         reminders = Reminders(store)
-        reminders.create(DUE_AT, "Call the clinic")
+        reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         assert reminders.tick(DUE_AT - timedelta(hours=1)) == []
         assert reminders.tick(DUE_AT - timedelta(hours=1)) == []
@@ -87,7 +97,7 @@ def test_work_due_during_downtime_still_fires(tmp_path: Path) -> None:
     db = tmp_path / "r.db"
 
     first = Store.open(db)
-    Reminders(first).create(DUE_AT, "Call the clinic")
+    Reminders(first).create(naive(DUE_AT), "UTC", "Call the clinic")
     first.close()
 
     # ... nothing running while the instant passes ...
@@ -109,7 +119,7 @@ def test_six_months_late_still_fires(tmp_path: Path) -> None:
     db = tmp_path / "r.db"
     store = Store.open(db)
     try:
-        Reminders(store).create(DUE_AT, "Call the clinic")
+        Reminders(store).create(naive(DUE_AT), "UTC", "Call the clinic")
         assert len(Reminders(store).tick(DUE_AT + timedelta(days=180))) == 1
     finally:
         store.close()
@@ -120,9 +130,9 @@ def test_due_work_comes_out_oldest_first(tmp_path: Path) -> None:
     store = Store.open(db)
     try:
         reminders = Reminders(store)
-        reminders.create(DUE_AT + timedelta(hours=2), "third")
-        reminders.create(DUE_AT, "first")
-        reminders.create(DUE_AT + timedelta(hours=1), "second")
+        reminders.create(naive(DUE_AT + timedelta(hours=2)), "UTC", "third")
+        reminders.create(naive(DUE_AT), "UTC", "first")
+        reminders.create(naive(DUE_AT + timedelta(hours=1)), "UTC", "second")
 
         fired = reminders.tick(DUE_AT + timedelta(hours=3))
         assert [r.text for r in fired] == ["first", "second", "third"]

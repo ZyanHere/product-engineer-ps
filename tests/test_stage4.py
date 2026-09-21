@@ -25,6 +25,16 @@ START = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
 
 
+def naive(instant: datetime) -> datetime:
+    """The same wall time, with the offset stripped.
+
+    Since Stage 5, `create` takes what the user *said* plus a zone rather than
+    an instant somebody worked out. These tests are not about zones, so they
+    say it in UTC -- which resolves to exactly the instants they always used.
+    """
+    return instant.replace(tzinfo=None)
+
+
 def _wired(tmp_path: Path, poll: float = 60.0) -> tuple[Reminders, FakeClock, Runner, Store]:
     store = Store.open(tmp_path / "r.db")
     reminders = Reminders(store)
@@ -68,7 +78,7 @@ def test_it_fires_with_nobody_asking(tmp_path: Path) -> None:
     """
     reminders, clock, runner, store = _wired(tmp_path)
     try:
-        reminders.create(DUE_AT, "Call the clinic")
+        reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         fired = runner.run_until(DUE_AT + timedelta(hours=1))
 
@@ -82,7 +92,7 @@ def test_it_does_not_fire_before_its_time(tmp_path: Path) -> None:
     """Running right up to the instant, and no further, fires nothing."""
     reminders, _clock, runner, store = _wired(tmp_path)
     try:
-        reminders.create(DUE_AT, "Call the clinic")
+        reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
         assert runner.run_until(DUE_AT) == []
     finally:
         store.close()
@@ -97,7 +107,7 @@ def test_anything_already_owed_goes_out_immediately(tmp_path: Path) -> None:
     store = Store.open(tmp_path / "r.db")
     try:
         reminders = Reminders(store)
-        reminders.create(DUE_AT, "Call the clinic")
+        reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         # The clock starts *after* the due time, and the horizon is one nap away.
         clock = FakeClock(DUE_AT + timedelta(hours=6))
@@ -116,7 +126,7 @@ def test_it_fires_exactly_once_however_long_it_runs(tmp_path: Path) -> None:
     """
     reminders, _clock, runner, store = _wired(tmp_path, poll=60.0)
     try:
-        reminders.create(DUE_AT, "Call the clinic")
+        reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
         fired = runner.run_until(DUE_AT + timedelta(days=2))
         assert len(fired) == 1
     finally:
@@ -133,7 +143,7 @@ def test_six_months_of_polling_costs_no_real_time(tmp_path: Path) -> None:
     reminders, clock, runner, store = _wired(tmp_path, poll=3600.0)
     try:
         far_off = START + timedelta(days=180)
-        reminders.create(far_off, "Book the dentist")
+        reminders.create(naive(far_off), "UTC", "Book the dentist")
 
         fired = runner.run_until(far_off + timedelta(hours=1))
 
@@ -153,7 +163,7 @@ def test_the_loop_holds_no_schedule(tmp_path: Path) -> None:
     store = Store.open(tmp_path / "r.db")
     try:
         reminders = Reminders(store)
-        reminders.create(DUE_AT, "Call the clinic")
+        reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         # First loop stops an hour short.
         clock = FakeClock(START)
@@ -179,7 +189,7 @@ def test_the_poll_interval_bounds_how_late_a_reminder_is(tmp_path: Path) -> None
     reminders, clock, runner, store = _wired(tmp_path, poll=3600.0)
     try:
         # Due one minute after the clock starts, but the loop naps for an hour.
-        reminders.create(START + timedelta(minutes=1), "Call the clinic")
+        reminders.create(naive(START + timedelta(minutes=1)), "UTC", "Call the clinic")
 
         fired = runner.run_until(START + timedelta(hours=2))
 

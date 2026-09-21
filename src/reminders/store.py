@@ -31,10 +31,18 @@ IN_MEMORY = ":memory:"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reminder (
-    id      INTEGER PRIMARY KEY,
-    due_at  TEXT    NOT NULL,
-    text    TEXT    NOT NULL,
-    done    INTEGER NOT NULL
+    id             INTEGER PRIMARY KEY,
+
+    -- what the user said, and which rules apply to it. Kept because this is
+    -- the intent; the instant below is only where it happens to land today.
+    local_datetime TEXT    NOT NULL,
+    iana_zone      TEXT    NOT NULL,
+
+    -- the resolved instant: what "is it owed?" compares against
+    due_at         TEXT    NOT NULL,
+
+    text           TEXT    NOT NULL,
+    done           INTEGER NOT NULL
 )
 """
 
@@ -51,6 +59,22 @@ class Store:
         connection = sqlite3.connect(str(path))
         connection.execute(_SCHEMA)
         connection.commit()
+
+        # `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a
+        # file written before Stage 5 still has the old four columns and would
+        # fail later with something cryptic about a missing column. Say so
+        # here instead. No migration machinery: this is a learning build, and
+        # inventing schema-versioning now would be exactly the kind of "we'll
+        # need it eventually" that this sequence exists to avoid.
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(reminder)")}
+        missing = {"local_datetime", "iana_zone"} - columns
+        if missing:
+            connection.close()
+            raise ValueError(
+                f"{path} was written before Stage 5 and has no {sorted(missing)}. "
+                "Start a fresh database file."
+            )
+
         return cls(connection)
 
     def close(self) -> None:
@@ -59,7 +83,7 @@ class Store:
     def load_all(self) -> list[Reminder]:
         """Every reminder, in creation order."""
         rows = self._connection.execute(
-            "SELECT id, due_at, text, done FROM reminder ORDER BY id"
+            "SELECT id, local_datetime, iana_zone, due_at, text, done FROM reminder ORDER BY id"
         ).fetchall()
         return [_to_reminder(row) for row in rows]
 
@@ -79,13 +103,15 @@ class Store:
         shape, so SQLite's string ordering and chronological ordering agree.
         """
         rows = self._connection.execute(
-            "SELECT id, due_at, text, done FROM reminder "
+            "SELECT id, local_datetime, iana_zone, due_at, text, done FROM reminder "
             "WHERE done = 0 AND due_at <= ? ORDER BY due_at, id",
             (now.isoformat(),),
         ).fetchall()
         return [_to_reminder(row) for row in rows]
 
-    def insert(self, due_at: datetime, text: str) -> Reminder:
+    def insert(
+        self, local_datetime: datetime, iana_zone: str, due_at: datetime, text: str
+    ) -> Reminder:
         """Write a new reminder and return it, with the id the database gave it.
 
         **Commits before returning.** That ordering is the entire point of this
@@ -98,11 +124,18 @@ class Store:
         everything already on disk.
         """
         cursor = self._connection.execute(
-            "INSERT INTO reminder (due_at, text, done) VALUES (?, ?, 0)",
-            (due_at.isoformat(), text),
+            "INSERT INTO reminder (local_datetime, iana_zone, due_at, text, done) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (local_datetime.isoformat(), iana_zone, due_at.isoformat(), text),
         )
         self._connection.commit()
-        return Reminder(id=int(cursor.lastrowid or 0), due_at=due_at, text=text)
+        return Reminder(
+            id=int(cursor.lastrowid or 0),
+            local_datetime=local_datetime,
+            iana_zone=iana_zone,
+            due_at=due_at,
+            text=text,
+        )
 
     def mark_done(self, reminder_id: int) -> None:
         """Record that a reminder has fired."""
@@ -114,7 +147,9 @@ def _to_reminder(row: tuple[object, ...]) -> Reminder:
     """One database row as a Reminder. SQLite has no boolean; 0 and 1 is it."""
     return Reminder(
         id=int(row[0]),  # type: ignore[call-overload]
-        due_at=datetime.fromisoformat(str(row[1])),
-        text=str(row[2]),
-        done=bool(row[3]),
+        local_datetime=datetime.fromisoformat(str(row[1])),
+        iana_zone=str(row[2]),
+        due_at=datetime.fromisoformat(str(row[3])),
+        text=str(row[4]),
+        done=bool(row[5]),
     )

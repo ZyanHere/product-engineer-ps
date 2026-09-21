@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from reminders.timezones import resolve
+
 if TYPE_CHECKING:
     from reminders.store import Store
 
@@ -46,7 +48,17 @@ class Reminder:
     """
 
     id: int
+    local_datetime: datetime
+    """What the user actually said, naive. "2026-03-09 09:00"."""
+
+    iana_zone: str
+    """Which rulebook applies. A name, never an offset -- an offset is the
+    answer in January, not the rule."""
+
     due_at: datetime
+    """Where those two land. Aware, always UTC. A computed index, so that
+    "is it owed?" stays one cheap comparison."""
+
     text: str
     done: bool = False
 
@@ -62,14 +74,21 @@ class Reminders:
     def __init__(self, store: Store) -> None:
         self._store = store
 
-    def create(self, due_at: datetime, text: str) -> Reminder:
+    def create(self, local_datetime: datetime, iana_zone: str, text: str) -> Reminder:
         """Schedule a reminder, durably.
 
-        `due_at` is a UTC instant the caller worked out. **Not because that is
-        right** -- people say "9am", not "13:00Z" -- but because nobody has
-        complained about it yet. Stage 5 is where that becomes obvious.
+        Takes what the user said and which zone they said it in -- not an
+        instant they worked out themselves. Resolution happens here, once, and
+        all three are stored: the intent stays authoritative and the instant is
+        the index the query uses.
+
+        Resolving **before** writing is deliberate. `resolve` is a pure
+        function that can reject a bad zone, so failing there costs nothing.
+        Writing first and resolving after would leave a row briefly existing
+        with no valid instant.
         """
-        return self._store.insert(due_at, text)
+        due_at = resolve(local_datetime, iana_zone)
+        return self._store.insert(local_datetime, iana_zone, due_at, text)
 
     def tick(self, now: datetime) -> list[Reminder]:
         """Fire everything that is owed at `now` and has not fired yet.
