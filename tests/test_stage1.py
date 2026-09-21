@@ -29,13 +29,21 @@ def test_does_not_fire_before_its_time() -> None:
 
 
 def test_fires_at_its_time() -> None:
-    reminders = Reminders(Store.open())
+    """Note what changed at Stage 3: `created` is a snapshot, not a handle.
+
+    This test used to assert `created.done is True`, which passed while every
+    program shared one list of live objects. Now `tick` reads fresh rows from
+    the store, so the object returned by `create` is a separate copy and
+    mutating it would mean nothing. Asking the store is the only honest check.
+    """
+    store = Store.open()
+    reminders = Reminders(store)
     created = reminders.create(DUE_AT, "Call the clinic")
 
     fired = reminders.tick(DUE_AT)
 
     assert [r.id for r in fired] == [created.id]
-    assert created.done is True
+    assert [r.done for r in store.load_all()] == [True]
 
 
 def test_fires_exactly_once() -> None:

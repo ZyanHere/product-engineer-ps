@@ -61,16 +61,29 @@ class Store:
         rows = self._connection.execute(
             "SELECT id, due_at, text, done FROM reminder ORDER BY id"
         ).fetchall()
-        return [
-            Reminder(
-                id=int(row[0]),
-                due_at=datetime.fromisoformat(str(row[1])),
-                text=str(row[2]),
-                # SQLite has no boolean type; 0 and 1 is the whole convention.
-                done=bool(row[3]),
-            )
-            for row in rows
-        ]
+        return [_to_reminder(row) for row in rows]
+
+    def due(self, now: datetime) -> list[Reminder]:
+        """Reminders that are owed and have not fired yet.
+
+        `due_at <= now`, never `== now`. A reminder is owed from its instant
+        **onwards**, not only at the exact moment somebody happened to look.
+
+        That one character is also why a reminder that came due while nothing
+        was running still fires: it is simply a row whose timestamp is further
+        in the past than usual. There is no catch-up routine and no recovery
+        mode -- the query never asked "what is new since I last looked", so it
+        never needed the loop to have been present.
+
+        Comparison works because the timestamps are ISO-8601 text with a fixed
+        shape, so SQLite's string ordering and chronological ordering agree.
+        """
+        rows = self._connection.execute(
+            "SELECT id, due_at, text, done FROM reminder "
+            "WHERE done = 0 AND due_at <= ? ORDER BY due_at, id",
+            (now.isoformat(),),
+        ).fetchall()
+        return [_to_reminder(row) for row in rows]
 
     def insert(self, due_at: datetime, text: str) -> Reminder:
         """Write a new reminder and return it, with the id the database gave it.
@@ -95,3 +108,13 @@ class Store:
         """Record that a reminder has fired."""
         self._connection.execute("UPDATE reminder SET done = 1 WHERE id = ?", (reminder_id,))
         self._connection.commit()
+
+
+def _to_reminder(row: tuple[object, ...]) -> Reminder:
+    """One database row as a Reminder. SQLite has no boolean; 0 and 1 is it."""
+    return Reminder(
+        id=int(row[0]),  # type: ignore[call-overload]
+        due_at=datetime.fromisoformat(str(row[1])),
+        text=str(row[2]),
+        done=bool(row[3]),
+    )

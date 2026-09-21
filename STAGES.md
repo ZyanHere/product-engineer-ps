@@ -72,10 +72,10 @@ The rework is listed per stage so it is never a surprise.
   STAGE 2   it vanished                              sqlite
       |     -- create one from another terminal --
       v
-  STAGE 3   the loop reads its own memory            poll the store
+  STAGE 3   it reads its own memory                  ask the store, due_at <= now
       |     -- stay down past the due time --
       v
-  STAGE 4   work due during downtime is lost         due_at <= now
+  STAGE 4   it only runs when you tell it to         a loop, and a clock
       |     -- ask someone in another timezone --
       v
   STAGE 5   whose 9am?                               local time + IANA zone
@@ -328,72 +328,105 @@ What if it has not been? **Stay down past a reminder's due time.**
 
 ---
 
-# STAGE 4 — Work due during downtime is lost
+# STAGE 4 — It only runs when you tell it to
+
+> **Corrected while building.** This stage was planned as *"work due during
+> downtime is lost"* — on the assumption that Stage 3 would reach for a
+> windowed query (*"what became due since my last check?"*) and lose anything
+> that fell between two ticks.
+>
+> It did not, and would not have. A window is only tempting when you have no
+> way to stop a reminder re-firing; we have had a `done` flag since Stage 1, so
+> the natural query was `done = 0 AND due_at <= now` — which handles overdue
+> work as a side effect rather than as a feature. Writing the window anyway
+> would have been staging a failure rather than finding one.
+>
+> So the overdue case is settled, pinned by two tests in Stage 3 (six hours
+> late, and six months late — the second is the one a window would fail). What
+> is genuinely still missing is this stage.
 
 | | |
 | --- | --- |
-| **Capability at the end** | a reminder that came due while nothing was running still fires, late, and visibly |
-| **Before this stage** | the loop polls the store |
-| **Rework** | Stage 3's windowed query is **replaced** |
-| **Traces to** | **AC2** · ANALYSIS §2.10, failure mode 26 |
+| **Capability at the end** | it runs on its own and fires things without being asked |
+| **Before this stage** | the store is the truth; any program sees any other's work |
+| **Rework** | `tick(now)` gains a caller that is not a human |
+| **Traces to** | ARCHITECTURE §3.6, §8.5 · ANALYSIS §9.9 |
 
 ### Break it
 
-```
-create a reminder for 12:00
-stop the process at 11:00
-start it again at 18:00
-```
+Create a reminder. Walk away. Come back.
 
 ### What happens
 
-Nothing fires. The row still says not-done. It will never fire.
+Nothing. It is still waiting.
 
-Worse than Stage 2: there the reminder was gone, which at least is obvious. Here it is **sitting in the database, visibly scheduled, and permanently ignored.**
+The reminder is correct, durable, visible to every program — and it will sit
+there forever, because **the only thing that ever fires anything is a human
+typing `tick`.**
 
 ### Why
 
-The query asks *"what became due between my last check and now?"* The last check was seven hours ago and the window does not stretch that far. The reminder fell between two ticks.
+There is no service. There is a library and a prompt.
 
-The mistake is subtle and worth naming precisely: the query was written as a question about **the loop's history** ("what have I not seen?") when it should be a question about **the world's state** ("what is owed?"). The first depends on the loop having been present. The second does not.
+Everything so far has been driven one instant at a time, by hand, which was
+exactly right while every question was *"what does it do at this moment?"*
+Nothing has ever had to decide **when to look next**.
 
 ### The concept
 
-**Ask for everything owed, not for everything new.**
+Something that wakes up, asks the store, and goes back to sleep.
 
-```
-    WHERE due_at <= now        not   WHERE due_at BETWEEN last_tick AND now
-```
+The moment that exists, two new things are true, and the second is the one
+that matters here:
 
-One comparison, unbounded below. An item that came due during an outage is simply a row whose timestamp is further in the past than usual — there is no special case, no catch-up routine, no recovery mode. Restart recovery becomes the *absence* of a feature.
+- the loop has to **wait**, and how long it waits is a choice with consequences
+- it has to wait *on something we control*, or every test that involves the
+  passage of time has to pass real seconds to run
 
-And a decision that has to be made explicitly rather than by accident: a reminder that is six hours late — do we still send it? For a reminder, **yes, and say how late it was.** Silently dropping a promise is the worse failure. (A staleness cutoff is a product choice; it is noted in BUILD_PLAN and not built here, because nobody has asked for it.)
+That second point is what finally earns a clock. Until now `now` has been a
+parameter typed into a prompt — simple, honest, and completely sufficient.
+A loop cannot take `now` as a parameter; it has to ask. And if it asks the
+operating system, then *"does a reminder fire six months late?"* becomes a
+test that waits six months.
+
+So: a `Clock` with `now()` **and** `sleep()`. Both, because the waiting is the
+part that has to be controllable — a clock that only tells the time leaves the
+poll interval running on real seconds, and advancing a fake clock by six hours
+would cause no polling at all.
 
 ### Build
 
-- **4.1** replace the windowed query with `due_at <= now`
-- **4.2** report lateness when firing, so the policy is visible rather than implied
-
-### Persistence · state · transactions
-
-No schema change. One operator.
+- **4.1** a `Clock` — `now()` and `sleep()`
+  - **4.1.1** a real one, and a fake one that advances only when told
+  - **4.1.2** deliberately *not* built yet: anything to do with several sleepers
+    at once. Deadline-ordered wakeups solve a problem that appears at Stage 11,
+    when two workers run together
+- **4.2** a loop: ask the store, fire what is owed, sleep, repeat
+- **4.3** the loop takes a clock; `tick(now)` keeps taking a parameter, and the
+  loop is simply the caller that supplies it
+- **4.4** the prompt keeps working, because driving it by hand is still the
+  clearest way to demonstrate a single instant
 
 ### Tests
 
-- down for six hours across the due time → fires on restart
-- **down for six months → still fires.** A windowed query passes the first test and silently fails this one, which is exactly why both exist
-- nothing fires early: one microsecond before the instant, nothing happens
-- the exact instant counts — `<=`, not `<`
+- a reminder fires with nobody typing anything
+- advancing the fake clock past the due time is enough; one second short is not
+- the loop keeps no schedule state — stopping and rebuilding it mid-run changes
+  nothing
+- a whole year of waiting runs in milliseconds, because nothing waits on real
+  time
 
 ### Still broken
 
-The notion of *when* is still "a UTC instant someone typed". No human thinks that way.
+The notion of *when* is still "a UTC instant somebody worked out". No human
+thinks that way.
 
 ### Next question
 
 **Show it to someone in another city.** What does "9am" mean?
 
 ---
+
 # STAGE 5 — Whose 9am?
 
 | | |

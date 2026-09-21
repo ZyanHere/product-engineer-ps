@@ -1,13 +1,18 @@
-"""Reminders: the list, and the function that walks it.
+"""Reminders: create them, and fire the ones that are owed.
 
-Stage 1 built this over a list in memory. Stage 2 keeps the list and puts a
-database behind it -- load everything at startup, work on the list, write each
-change back as it happens.
+Stage 1 kept a list in memory. Stage 2 put a database behind that list, and
+the list was still in charge -- the database was a **backup** of it. Two
+programs running at once proved how wrong that was: one created a reminder,
+the other never saw it, because the other was reading a snapshot it took at
+startup.
 
-That "read it in, work on it, write it out" shape is the natural first move,
-and it is worth noticing that the list is still in charge. The database is
-currently a **backup of the list**, not the other way round. Stage 3 is where
-that turns out to matter.
+Stage 3 deletes the snapshot. Every question is asked of the store, every
+time.
+
+That sounds like a small change and it is the central one. If nothing about
+the schedule lives in memory between calls, then throwing the whole program
+away and rebuilding it is a no-op -- restart stops being a special case and
+becomes the ordinary case that happens to have a gap in it.
 
 The rule that holds from Stage 1 onwards
 ----------------------------------------
@@ -34,6 +39,10 @@ class Reminder:
     `done` is a plain flag. That is enough while there is exactly one way to
     finish and nothing can go wrong -- Stage 8 is where a reminder first needs
     to end in more than one way.
+
+    Since Stage 3 this is a **snapshot of a row**, not a handle on one. Two
+    calls return two objects; changing one changes nothing anywhere. Every
+    write goes through the store.
     """
 
     id: int
@@ -43,40 +52,33 @@ class Reminder:
 
 
 class Reminders:
-    """Every reminder we know about, backed by a store."""
+    """Create reminders, and fire the ones that are owed.
+
+    Holds **no** reminders of its own. It is a thin thing over the store on
+    purpose: there is no list to go stale, no cache to invalidate, and nothing
+    to reconcile after a restart.
+    """
 
     def __init__(self, store: Store) -> None:
         self._store = store
-        # The naive move, and the natural one: pull the whole table into memory
-        # once, then work on that. It is correct for a single process that
-        # nobody else is talking to -- which is exactly the assumption Stage 3
-        # breaks.
-        self._items: list[Reminder] = store.load_all()
 
     def create(self, due_at: datetime, text: str) -> Reminder:
         """Schedule a reminder, durably.
-
-        The write goes first and the list second, so a crash between them loses
-        nothing that was promised.
 
         `due_at` is a UTC instant the caller worked out. **Not because that is
         right** -- people say "9am", not "13:00Z" -- but because nobody has
         complained about it yet. Stage 5 is where that becomes obvious.
         """
-        reminder = self._store.insert(due_at, text)
-        self._items.append(reminder)
-        return reminder
+        return self._store.insert(due_at, text)
 
     def tick(self, now: datetime) -> list[Reminder]:
-        """Fire everything that is due and has not fired yet.
+        """Fire everything that is owed at `now` and has not fired yet.
 
-        `now` is passed in, never read from the system. Returns what fired, so
-        the caller decides what to do about it.
-
-        `due_at <= now`, not `== now`: a reminder is owed from its instant
-        onwards, not only at the exact moment somebody happened to look.
+        The store is asked afresh, so a reminder created a moment ago by some
+        other program is picked up here. Returns what fired, leaving the caller
+        to decide what to do about it.
         """
-        fired = [r for r in self._items if not r.done and r.due_at <= now]
+        fired = self._store.due(now)
         for reminder in fired:
             reminder.done = True
             self._store.mark_done(reminder.id)
@@ -84,4 +86,4 @@ class Reminders:
 
     def all(self) -> list[Reminder]:
         """Everything, in creation order."""
-        return list(self._items)
+        return self._store.load_all()
