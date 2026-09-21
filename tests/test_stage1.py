@@ -1,5 +1,9 @@
 """Stage 1 — a reminder fires.
 
+Still true after Stage 2, which is why these tests stay. They now build over an
+in-memory store, because `Reminders` needs one -- the behaviour they assert is
+unchanged.
+
 Three tests, one per thing that could go wrong at this size: it fires too
 early, it never fires, or it fires more than once.
 
@@ -12,19 +16,20 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from reminders.core import Reminders
+from reminders.store import Store
 
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
 
 
 def test_does_not_fire_before_its_time() -> None:
-    reminders = Reminders()
+    reminders = Reminders(Store.open())
     reminders.create(DUE_AT, "Call the clinic")
 
     assert reminders.tick(DUE_AT - timedelta(minutes=1)) == []
 
 
 def test_fires_at_its_time() -> None:
-    reminders = Reminders()
+    reminders = Reminders(Store.open())
     created = reminders.create(DUE_AT, "Call the clinic")
 
     fired = reminders.tick(DUE_AT)
@@ -39,7 +44,7 @@ def test_fires_exactly_once() -> None:
     Without this, every tick after the due time would fire the reminder again:
     a busy loop that looks like healthy operation.
     """
-    reminders = Reminders()
+    reminders = Reminders(Store.open())
     reminders.create(DUE_AT, "Call the clinic")
 
     assert len(reminders.tick(DUE_AT)) == 1
@@ -53,14 +58,14 @@ def test_an_overdue_reminder_still_fires() -> None:
     somebody happened to look. This costs one character and it is the reason
     Stage 4's problem is about a query window rather than about this.
     """
-    reminders = Reminders()
+    reminders = Reminders(Store.open())
     reminders.create(DUE_AT, "Call the clinic")
 
     assert len(reminders.tick(DUE_AT + timedelta(hours=6))) == 1
 
 
 def test_fires_in_due_order() -> None:
-    reminders = Reminders()
+    reminders = Reminders(Store.open())
     reminders.create(DUE_AT + timedelta(hours=2), "third")
     reminders.create(DUE_AT, "first")
     reminders.create(DUE_AT + timedelta(hours=1), "second")

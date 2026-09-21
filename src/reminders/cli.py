@@ -1,20 +1,18 @@
-"""A tiny prompt, so you can actually poke at Stage 1.
+"""A tiny prompt, so you can actually poke at the thing.
 
-    python -m reminders
+    python -m reminders --db reminders.db
 
     > create 2026-03-09T13:00:00Z Call the clinic
-    > tick 2026-03-09T12:59:00Z
-    > tick 2026-03-09T13:00:00Z
-    DUE  Call the clinic
+    > quit
+    ... start it again ...
+    > list
+      1  waiting  2026-03-09T13:00:00+00:00  Call the clinic
 
-Why a prompt and not two shell commands
----------------------------------------
-Because the reminders live in memory. `create` in one process and `tick` in
-another would share nothing at all, so a two-command CLI could not work yet.
-
-That is not a limitation to route around -- it is Stage 2 arriving early, and
-it is worth feeling directly: create a reminder, `quit`, start again, and
-`list` is empty.
+Still a prompt rather than two shell commands, and now for a different reason.
+At Stage 1 it had to be, because the reminders lived in memory and two
+processes would have shared nothing. At Stage 2 they survive, so either shape
+would work -- the prompt stays because it is a long-running process, and Stage
+3's problem only shows up in one of those.
 
 `tick` takes the instant as an argument. That is how this system is driven:
 time is a parameter, never something a function reaches out and reads.
@@ -22,9 +20,11 @@ time is a parameter, never something a function reaches out and reads.
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime
 
 from reminders.core import Reminder, Reminders
+from reminders.store import IN_MEMORY, Store
 
 __all__ = ["main"]
 
@@ -47,9 +47,25 @@ def _format(reminder: Reminder) -> str:
     return f"  {reminder.id}  {state:<7}  {reminder.due_at.isoformat()}  {reminder.text}"
 
 
-def main() -> int:
-    reminders = Reminders()
-    print("stage 1 - a reminder that fires. nothing survives exit.\n")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="reminders")
+    parser.add_argument(
+        "--db",
+        default=IN_MEMORY,
+        help="database file; the default keeps everything in memory and loses it on exit",
+    )
+    args = parser.parse_args(argv)
+
+    store = Store.open(args.db)
+    try:
+        return _prompt(Reminders(store), str(args.db))
+    finally:
+        store.close()
+
+
+def _prompt(reminders: Reminders, db: str) -> int:
+    where = "in memory - lost on exit" if db == IN_MEMORY else db
+    print(f"stage 2 - reminders that survive a restart.  store: {where}\n")
     print(HELP)
 
     while True:
