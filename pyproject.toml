@@ -79,27 +79,27 @@ select = [
 ]
 
 # ---------------------------------------------------------------------------
-# The real-time ban (BUILD_PLAN P0.2.4)
+# The real-time ban (STAGES.md, Stage 4)
 #
-# Anything that reads the wall clock or waits on it is forbidden outside
-# adapters/clock_system.py. Everything else takes a `Clock` as a parameter.
+# Stage 4 introduced a clock, so this rule only now has something to guard.
+# `src/reminders/clock.py` is the one file allowed to read the wall clock or
+# wait on it; everywhere else takes a Clock and is handed the time.
 #
-# This is not a style preference. One `asyncio.sleep` on a scheduling path
-# makes that path untestable without waiting real seconds; one `datetime.now()`
-# makes a daylight-saving bug in March unreproducible in January.
+# It is not a style preference. One real `sleep` on the polling path makes
+# "does a reminder six months out fire?" a test that waits six months, and one
+# `datetime.now()` makes a daylight-saving bug in March unreproducible in
+# January.
 #
-# This lint rule is the FIRST line of defence, not the only one: `# noqa` can
-# silence it. tests/unit/test_no_real_time.py parses the syntax tree instead,
-# and that is the mechanism of record.
+# The list only names what the code can actually reach today. `asyncio.sleep`
+# and `asyncio.timeout` are not here because nothing in this project uses
+# asyncio yet -- they go on the list at the stage that introduces it.
 # ---------------------------------------------------------------------------
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"asyncio.sleep".msg = "Use Clock.sleep(). Real sleeps make scheduling untestable."
-"asyncio.timeout".msg = "Measured by the event loop's own clock, so a deadline set with it lives in a second time domain invisible to the injected clock. Race the send against Clock.sleep() instead (ARCHITECTURE 0.1)."
-"time.sleep".msg = "Use Clock.sleep(). Also blocks the event loop."
+"time.sleep".msg = "Use Clock.sleep()."
 "datetime.datetime.now".msg = "Use Clock.now()."
 "datetime.datetime.utcnow".msg = "Deprecated, and returns a NAIVE datetime. Use Clock.now()."
 "datetime.date.today".msg = "Use Clock.now()."
 
 [tool.ruff.lint.per-file-ignores]
 # The one file the ban exists to confine. Nothing else may be added here.
-"src/reminders/adapters/clock_system.py" = ["TID251"]
+"src/reminders/clock.py" = ["TID251"]
