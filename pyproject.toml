@@ -11,21 +11,17 @@ requires-python = ">=3.12"
 # ---------------------------------------------------------------------------
 # Runtime dependencies
 #
-# Deliberately minimal. A dependency is added in the phase whose failure mode
-# requires it (BUILD_PLAN R1), not in advance. Today that is exactly one.
+# None yet, and that is the point. A dependency is added at the stage whose
+# failure requires it (STAGES.md, rule 1) -- never in advance.
 #
-# tzdata: NOT optional, and not a convenience.
-#   `zoneinfo` falls back to the operating system's tz database when the
-#   `tzdata` package is absent. Windows has no OS tz database at all, and slim
-#   containers usually ship without one, so `ZoneInfo("America/New_York")`
-#   raises ZoneInfoNotFoundError on a reviewer's machine and not on the
-#   author's. This is ANALYSIS failure mode 24, and it is the reason the
-#   package is pinned here rather than assumed.
-#   See src/reminders/preflight.py for the boot-time check that proves it.
+# Coming, and when:
+#   Stage 5   tzdata   -- the moment local time and zones exist. `zoneinfo`
+#                         borrows the operating system's tz database, and
+#                         Windows has none at all, so it must be declared
+#                         rather than assumed (ANALYSIS failure mode 24).
+#   Stage 16  fastapi, pydantic -- when something other than a CLI calls this.
 # ---------------------------------------------------------------------------
-dependencies = [
-    "tzdata>=2024.1",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [

@@ -1,0 +1,1403 @@
+# STAGES — the build journey
+
+**This file is the implementation order.** What we build now, what we break next, what we learn from the break, and the smallest thing that fixes it.
+
+It is deliberately **not** [BUILD_PLAN.md](BUILD_PLAN.md), which is the destination: the list of what must eventually be true. Two different jobs, kept in two different files, because confusing them is exactly what went wrong the first time.
+
+| | |
+| --- | --- |
+| **STAGES.md** | the journey — *what do we do next, and why* |
+| **BUILD_PLAN.md** | the destination — *what must ultimately be true* |
+| ARCHITECTURE.md · CORRECTNESS_MODEL.md · ANALYSIS.md | the reasoning we will converge on, unchanged |
+
+---
+
+## The loop
+
+```
+   build something small that works
+            |
+            v
+   run it  --  really run it, not in your head
+            |
+            v
+   ask what is wrong with it
+            |
+            v
+   reproduce the failure  --  make it happen on purpose
+            |
+            v
+   understand the root cause, in plain words
+            |
+            v
+   only now: name the concept
+            |
+            v
+   add the smallest mechanism that fixes it
+            |
+            v
+   write the test that fails without that mechanism
+            |
+            v
+   ask what breaks NOW
+            |
+            v
+   repeat
+```
+
+### Five rules this file holds itself to
+
+| | |
+| --- | --- |
+| **1** | **Nothing is built before the failure that motivates it.** If the only reason for a column, an index, a constraint or a predicate is "Stage 13 will need it", it does not go in. |
+| **2** | **The problem comes before the vocabulary.** A stage never opens with *"now we learn about leases."* It opens with *"two workers both sent it — why?"* The term is introduced only once the failure is understood. |
+| **3** | **Rework is the point, not a cost.** A simple `last_error` column is replaced by attempt history. A boolean claim flag is replaced by a lease, then by fencing. Building the wrong thing first and feeling why it is wrong is the mechanism by which the final shape becomes explainable. |
+| **4** | **Every stage ends with something that runs.** Not a refactor, not scaffolding — a capability you can demonstrate from a terminal. |
+| **5** | **One problem per stage.** If a stage fixes two unrelated things, it is two stages. |
+
+### What this costs, stated up front
+
+This order builds several things twice. That is deliberate. The alternative — writing the final schema on day one — produces code that is correct and unexplainable, which is the failure we are resetting from.
+
+The rework is listed per stage so it is never a surprise.
+
+---
+
+## Stage dependency map
+
+```
+  STAGE 1   a reminder fires                         in memory, tick(now)
+      |     -- restart it --
+      v
+  STAGE 2   it vanished                              sqlite
+      |     -- create one from another terminal --
+      v
+  STAGE 3   the loop reads its own memory            poll the store
+      |     -- stay down past the due time --
+      v
+  STAGE 4   work due during downtime is lost         due_at <= now
+      |     -- ask someone in another timezone --
+      v
+  STAGE 5   whose 9am?                               local time + IANA zone
+      |     -- pick a DST boundary --
+      v
+  STAGE 6   that local time does not exist           detect + classify
+      |     -- make the destination fail --
+      v
+  STAGE 7   silent failure, hammered destination     record it, back off
+      |     -- make the failure permanent --
+      v
+  STAGE 8   it retries forever                       budget + terminal failed
+      |     -- kill the process mid-send --
+      v
+  STAGE 9   did it send?  and they got two           attempt record + key
+      |     -- crash mid-send three times --
+      v
+  STAGE 10  the crash was free                       spend the budget at the try
+      |     -- run two workers --
+      v
+  STAGE 11  both of them sent it                     claiming
+      |     -- kill the worker holding it --
+      v
+  STAGE 12  stuck, and a record with no ending       expiry + close what was left
+      |     -- make the send slower than the claim --
+      v
+  STAGE 13  the slow one overwrote the new one       a rising claim number
+      |     -- edit while it is sending --
+      v
+  STAGE 14  it delivered the old message             version + immutable facts
+      |     -- cancel while it is sending --
+      v
+  STAGE 15  cancelled, history hangs open            cancel + a sweep
+      |
+      v
+  STAGE 16  something other than a CLI needs it      HTTP API
+      |
+      v
+  STAGE 17  all of it at once                        benchmark + submission
+```
+
+Notice two things about the order.
+
+**Timezones come early.** They are a *product* complaint — "my reminder arrived at the wrong time" — not a distributed-systems concern. A user hits that long before they hit a concurrency bug.
+
+**Retry causes the duplicate.** Stage 7 adds retry to stop losing reminders. Stage 9's duplicate exists *because* retry exists. And Stage 10 exists because Stage 9 added a way to die that routes around Stage 8's budget. The chain is causal, not curated: each fix creates the next problem.
+
+---
+
+## Stage 0 does not exist
+
+An earlier draft opened with a clock: a `Clock` port, a `SystemClock`, a `ManualClock` that wakes sleepers in deadline order, and a syntax-tree scanner banning real time everywhere else. Four hundred lines, before a single reminder existed.
+
+It was justified as "the microscope" -- the instrument you need to observe the product, rather than a feature of it. That argument is half right and was used to smuggle in three-quarters of a mechanism.
+
+**What Stage 1 actually needs is a parameter.** `tick(now)`. Time is an argument, not a service. Nothing sleeps, so nothing needs a clock.
+
+**When the port genuinely arrives:** the first time the system has to *wait on its own* -- a loop that polls, rather than a command you invoke once. Until then, every experiment here is driven by passing a different `now` on the command line, which is both simpler and a more honest proof, because the value is visible in the shell history.
+
+**When the elaborate `ManualClock` arrives:** later still. Deadline-ordered release with a yield between wakeups solves a problem that only exists with **several concurrent sleepers**, which is Stage 11, when two workers run at once.
+
+So the retrofit that was supposed to be expensive is: a loop takes a clock, calls `now()`, and passes the result into the `tick()` that already accepts it. Small.
+
+### What survives from day one is a rule, not code
+
+> **Time never enters implicitly.** No function reads the current time; it is passed in. Every experiment states the instant it ran at.
+
+That is one line in a document. At sixty lines of code you do not need a syntax-tree scanner to know you have followed it -- and when the codebase is large enough that you do, that is the failure which earns the scanner.
+
+*(The removed work is in git at `b4e3e64` if any of it is worth pulling back when the clock is genuinely due.)*
+
+---
+
+# STAGE 1 — Can we have a reminder at all?
+
+| | |
+| --- | --- |
+| **Capability at the end** | create a reminder, tick past its time, watch it fire |
+| **Before this stage** | nothing |
+| **Traces to** | AC1 (the naive half) |
+
+### What we are trying to do
+
+The smallest thing that could be called a reminder service. A list, a loop, a printed message.
+
+**Deliberately absent, and all of it fine:** no database, no timezones, no retry, no history, no concurrency, no idempotency. Those are not bugs to prevent. They are the next sixteen stages, each one discovered by breaking what came before.
+
+### Build
+
+- **1.1** `Reminder` — an id, a UTC instant, some text, a `done` flag. Nothing else.
+- **1.2** an in-memory list
+- **1.3** `create(when, text)` — appends to the list
+- **1.4** `tick(now)` — walk the list; anything due and not done, print it and mark it done
+- **1.5** a two-command CLI: `create`, `tick --now <instant>`
+  - **1.5.1** `--now` is not a test hook. It is how the thing is driven: **time is a parameter**, never something a function reaches out and reads. Every experiment in this file states the instant it ran at, and that instant is visible in the shell history
+
+Times are UTC instants supplied by the caller. **Not because that is right** — it is not, and Stage 5 is where that becomes obvious — but because nobody has complained about it yet.
+
+### Persistence · state · transactions
+
+None. There is no database. `done` is a boolean in memory.
+
+### Tests
+
+- a reminder created for T does not fire before T
+- it fires at T
+- it fires exactly once — a second `tick(now)` does nothing
+
+### Still broken
+
+Almost everything, and that is the honest position. The list of known holes is the table of contents for this file.
+
+### Next question
+
+The simplest thing anyone would try: **restart it.**
+
+---
+
+# STAGE 2 — It vanished
+
+| | |
+| --- | --- |
+| **Capability at the end** | a reminder survives the process being killed |
+| **Before this stage** | reminders fire, in memory |
+| **Traces to** | CORRECTNESS_MODEL I-1 · ARCHITECTURE D1 |
+
+### Break it
+
+```
+create a reminder for 12:00
+stop the process
+start it again
+```
+
+### What happens
+
+The reminder is gone. Not late, not failed — **gone**, with nothing anywhere indicating it ever existed.
+
+### Why
+
+The list lived in the process. When the process ended, so did the list.
+
+This is worth sitting with for a moment, because it is the whole problem in miniature. A reminder is a **promise**, and a promise that only exists while a program happens to be running is not a promise. The user said "remind me at noon" and the system agreed — then quietly forgot, with no error and no trace.
+
+### The concept
+
+**Durability.** The commitment has to be written somewhere that outlives the process.
+
+That immediately raises a second question we should answer now rather than later: written *where*, and *when*? If we write it after telling the user "done", there is a window where they believe they have a reminder and we do not. So the write happens first, and "created" means "written", not "accepted".
+
+### Build
+
+- **2.1** SQLite, one file, one table
+  - **2.1.1** `id`, `due_at`, `text`, `done` — four columns, matching Stage 1's object exactly
+  - **2.1.2** nothing else. No indexes, no constraints, no pragmas beyond opening the file. None of that has a reason yet.
+- **2.2** `create` writes a row and returns only once the write has committed
+- **2.3** at startup, load every row into memory; `tick()` works on that list as before; write `done` back when it fires
+
+Step 2.3 is the naive move, and it is the natural one — *"read it in, work on it, write it out."* Stage 3 is where it falls over.
+
+### Persistence
+
+**New.** One table:
+
+```
+reminder(id, due_at, text, done)
+```
+
+*Why we need it:* the process dies and takes the promise with it.
+*Smallest change that fixes it:* write the row before acknowledging.
+*What may force a change later:* almost every stage from here.
+
+### Tests
+
+- create, discard the entire program, rebuild it against the same file — the reminder is still there
+- it still fires after the restart
+- it does not fire twice across a restart
+
+### Still broken
+
+Everything else. And one new thing we cannot see yet: the loop is now working from a **copy** of the database taken at boot.
+
+### Next question
+
+What if something changes the database while the loop is running?
+
+---
+
+# STAGE 3 — The loop is reading its own memory
+
+| | |
+| --- | --- |
+| **Capability at the end** | the loop reacts to reminders it did not create itself |
+| **Before this stage** | reminders survive restart |
+| **Rework** | Stage 2's "load everything at boot" is **deleted** |
+| **Traces to** | ARCHITECTURE §8.1, D4 |
+
+### Break it
+
+Two terminals.
+
+```
+terminal A:  start the loop, leave it running
+terminal B:  create a reminder due in one minute
+terminal A:  advance the clock past it
+```
+
+### What happens
+
+Nothing. The reminder sits in the database, due, and the loop never touches it.
+
+### Why
+
+The loop is not looking at the database. It is looking at a **snapshot** of the database taken when it started, and that snapshot is now wrong.
+
+The database was supposed to be where the truth lives. Instead it has quietly become a backup of a list that lives in memory — which is Stage 1's problem wearing a disguise.
+
+### The concept
+
+**The store is the source of truth, not a cache you load at boot.** Every cycle asks the database what is due. Nothing about the schedule lives in memory between cycles.
+
+That has a consequence worth naming now, because the rest of this file leans on it: if nothing required for correctness lives in memory, then throwing the whole program away and rebuilding it is a no-op. Restart stops being a special case.
+
+### Build
+
+- **3.1** delete the boot-time load entirely
+- **3.2** `tick()` asks the database directly for what is due
+  - **3.2.1** the obvious first query: *what has become due since my last check?* — a window between the previous tick and now
+- **3.3** fire, then write `done` back immediately
+
+Step 3.2.1 is the naive query, and it is what most people write first, because the loop is thinking in ticks. Stage 4 is where that assumption breaks.
+
+### Persistence · state · transactions
+
+No schema change. The change is *who reads it and when*.
+
+### Tests
+
+- a reminder created by a different connection, while the loop is running, still fires
+- the loop keeps no schedule state between cycles: tick twice with nothing due and nothing changes
+- discarding and rebuilding the entire object graph mid-run changes nothing
+
+### Still broken
+
+The window in 3.2.1 assumes the loop has been running continuously.
+
+### Next question
+
+What if it has not been? **Stay down past a reminder's due time.**
+
+---
+
+# STAGE 4 — Work due during downtime is lost
+
+| | |
+| --- | --- |
+| **Capability at the end** | a reminder that came due while nothing was running still fires, late, and visibly |
+| **Before this stage** | the loop polls the store |
+| **Rework** | Stage 3's windowed query is **replaced** |
+| **Traces to** | **AC2** · ANALYSIS §2.10, failure mode 26 |
+
+### Break it
+
+```
+create a reminder for 12:00
+stop the process at 11:00
+start it again at 18:00
+```
+
+### What happens
+
+Nothing fires. The row still says not-done. It will never fire.
+
+Worse than Stage 2: there the reminder was gone, which at least is obvious. Here it is **sitting in the database, visibly scheduled, and permanently ignored.**
+
+### Why
+
+The query asks *"what became due between my last check and now?"* The last check was seven hours ago and the window does not stretch that far. The reminder fell between two ticks.
+
+The mistake is subtle and worth naming precisely: the query was written as a question about **the loop's history** ("what have I not seen?") when it should be a question about **the world's state** ("what is owed?"). The first depends on the loop having been present. The second does not.
+
+### The concept
+
+**Ask for everything owed, not for everything new.**
+
+```
+    WHERE due_at <= now        not   WHERE due_at BETWEEN last_tick AND now
+```
+
+One comparison, unbounded below. An item that came due during an outage is simply a row whose timestamp is further in the past than usual — there is no special case, no catch-up routine, no recovery mode. Restart recovery becomes the *absence* of a feature.
+
+And a decision that has to be made explicitly rather than by accident: a reminder that is six hours late — do we still send it? For a reminder, **yes, and say how late it was.** Silently dropping a promise is the worse failure. (A staleness cutoff is a product choice; it is noted in BUILD_PLAN and not built here, because nobody has asked for it.)
+
+### Build
+
+- **4.1** replace the windowed query with `due_at <= now`
+- **4.2** report lateness when firing, so the policy is visible rather than implied
+
+### Persistence · state · transactions
+
+No schema change. One operator.
+
+### Tests
+
+- down for six hours across the due time → fires on restart
+- **down for six months → still fires.** A windowed query passes the first test and silently fails this one, which is exactly why both exist
+- nothing fires early: one microsecond before the instant, nothing happens
+- the exact instant counts — `<=`, not `<`
+
+### Still broken
+
+The notion of *when* is still "a UTC instant someone typed". No human thinks that way.
+
+### Next question
+
+**Show it to someone in another city.** What does "9am" mean?
+
+---
+# STAGE 5 — Whose 9am?
+
+| | |
+| --- | --- |
+| **Capability at the end** | "9am in New York" and "9am in Kolkata" are different moments, and both are right |
+| **Before this stage** | reminders fire reliably, at a UTC instant the caller supplied |
+| **Rework** | `due_at` stops being the thing the user gives us |
+| **Traces to** | ANALYSIS §9 · CORRECTNESS_MODEL I-14 |
+
+### Break it
+
+Give the thing to a second person in another country and ask them both to set a 9am reminder.
+
+```
+person in New York:   9am        ->  they type 14:00Z
+person in Kolkata:    9am        ->  they type 03:30Z
+```
+
+Then have either of them try it in July.
+
+### What happens
+
+Either the user does the timezone arithmetic in their head — which is not a product — or they type their local time and it fires at the wrong moment for everyone.
+
+And the one that really stings: a New Yorker who worked out `14:00Z` in January finds their 9am reminder arriving at 10am in July.
+
+### Why
+
+We asked the user for a UTC instant, which is not a thing people have. People have *"9am on Tuesday"*.
+
+And here is the part that matters more than it first appears: **"9am on Tuesday" is not a moment in time at all.** It becomes one only when you apply a set of rules — and those rules depend on where you are and change twice a year.
+
+So the January arithmetic was not merely inconvenient. It was *wrong for July*, because the user did not want an instant. They wanted 9am.
+
+### The concept
+
+**Store the intent, and store what it resolves to.**
+
+Three things, not one:
+
+```
+   local_datetime   "2026-03-09 09:00"     what the user actually said
+   iana_zone        "America/New_York"      which rulebook applies
+   due_at           "2026-03-09T13:00:00Z"  where those two land
+```
+
+Why all three:
+
+- **only the instant** — the intent is gone forever; you can never re-derive 9am
+- **only local + zone** — "is it due?" becomes a calculation that can move under you
+- **both** — the intent is authoritative, the instant is a computed index for the query
+
+And why an IANA *name* rather than an offset: `-05:00` is the **answer** in January, not the **rule**. New York is `-05:00` in winter and `-04:00` in summer. Store the offset and you have kept one moment's answer and thrown away everything needed to compute any other.
+
+### Build
+
+- **5.1** `resolve(local_datetime, zone) -> instant`, a plain function
+  - **5.1.1** it takes **no clock** — it must give the same answer today and in five years, or a stored instant is not reproducible
+- **5.2** `create` takes a local time and a zone; resolves once; stores all three
+- **5.3** the query still compares `due_at` — instants only, never local time
+  - **5.3.1** *why never local time:* during a daylight-saving fall-back, local wall time runs **backwards** — 01:30 happens, then 01:00 happens again. A due-check against local time can fire twice or go back on itself. Instants only move forward.
+
+### Persistence
+
+**Changed.** `due_at` stays; `local_datetime` and `iana_zone` are added beside it.
+
+*What failure made us need this:* the user's intent was unrecoverable and wrong six months later.
+*Smallest change:* two columns and one function.
+*What may force a change later:* Stage 14 - editing.
+
+### Tests
+
+- 09:00 New York and 09:00 Kolkata on the same date are different instants
+- 09:00 New York in January and in July are different offsets — the reason the zone name is stored
+- the resolver is pure: same inputs, same output
+- a caller who supplies an offset is rejected — the zone is a separate field, not something smuggled in
+
+### Still broken
+
+The resolver is quietly wrong twice a year, and it will not tell you.
+
+### Next question
+
+**Pick 2026-03-08 and ask for 02:30 in New York.**
+
+---
+
+# STAGE 6 — That local time does not exist
+
+| | |
+| --- | --- |
+| **Capability at the end** | the system knows which daylight-saving case it hit, and says so |
+| **Before this stage** | local time and zone resolve to an instant |
+| **Traces to** | **AC7** · CORRECTNESS_MODEL I-15, §20 decisions 1–2 · ANALYSIS §2.9 |
+
+### Break it
+
+```
+create  02:30  2026-03-08  America/New_York    (clocks jump 02:00 -> 03:00)
+create  01:30  2026-11-01  America/New_York    (clocks jump 02:00 -> 01:00)
+```
+
+### What happens
+
+Both are accepted. Both produce a confident, plausible instant. **Neither raises anything.**
+
+The first local time never occurs that day. The second occurs twice, an hour apart. The library picked something in both cases and did not mention it.
+
+### Why
+
+Local time is not continuous. Twice a year it has a hole in it and a fold in it. The library resolves both silently because there is no answer it could give that is obviously correct, and picking quietly is easier than explaining.
+
+The consequence is a reminder that arrives an hour off, with **nothing anywhere in the system indicating anything unusual happened.** No error, no log line, no column. Just a user asking why.
+
+### The concept
+
+Three separate things, and only the first is the one people think of:
+
+1. **A policy** — what *should* 02:30 mean on a day when it does not exist?
+2. **Detection** — knowing you are in that case at all, since nothing tells you
+3. **A record** — storing which case it was, so the answer is auditable rather than lucky
+
+The third is the one that matters most here. Our chosen policies happen to coincide with what the library silently does anyway, so the *instant* barely changes. What changes is that the system can now **show it knew**.
+
+### Build
+
+- **6.1** detection, because nothing raises
+  - **6.1.1** does it exist? convert to UTC and back; if the local time came back different, it never occurred
+  - **6.1.2** is it ambiguous? ask for the offset under both readings; if they differ, it occurs twice
+  - **6.1.3** **order matters:** in a gap *both* checks trip, so existence must be tested first or a gap gets labelled an ambiguity — a record that describes a policy we did not apply
+- **6.2** the policies, chosen and written down
+  - **6.2.1** does not exist → **shift forward by the gap** (02:30 → 03:30). Never early; a reminder arriving before you asked for it is a worse failure than one arriving after
+  - **6.2.2** happens twice → **take the first**. Earliest moment matching the request
+- **6.3** store the classification: `exact` / `gap_shifted` / `overlap_first`
+- **6.4** return it from `create`, so the user is told at the time rather than surprised later
+
+### Persistence
+
+**Changed.** One non-nullable column: `resolution_class`.
+
+*Why non-nullable:* a nullable one would let the record be silently skipped, which is the exact failure being fixed.
+
+### Tests
+
+- gap: 02:30 → 07:30Z, classified `gap_shifted`
+- overlap: 01:30 → 05:30Z, classified `overlap_first`
+- a gap is **not** classified as an overlap — the mutation is to swap 6.1.1 and 6.1.2
+- an ordinary time is `exact`
+- **`Asia/Kolkata` has the same offset in January and July.** This is a negative control, not filler: Kolkata is `+05:30` all year, so it is possible to pass "two IANA zones" while never touching a transition. This test asserts the DST tests are not passing for the wrong reason
+
+### Still broken
+
+Delivery is assumed to work. It prints to a terminal and that always succeeds.
+
+### Next question
+
+**Make the destination fail.**
+
+---
+
+# STAGE 7 — Silent failure, and a hammered destination
+
+| | |
+| --- | --- |
+| **Capability at the end** | a failed delivery is visible, and the retry does not hammer |
+| **Before this stage** | correct scheduling, correct times |
+| **Traces to** | **AC3** (first half) · ANALYSIS §10 |
+
+### Break it
+
+Replace the destination with one that refuses, then watch for a minute.
+
+### What happens
+
+Two things, and only one is obvious.
+
+The obvious one: with a one-second poll, the destination is hit **sixty times a minute**. When it recovers, the reminder is delivered — so the system "works", in the sense that a self-healing infinite retry loop works.
+
+The non-obvious one: **there is no trace of any of it.** No error recorded, no count, no timestamp. If the destination never recovers, the reminder sits in `not done` forever and nothing in the database explains why.
+
+### Why
+
+We treated "not delivered" as the same thing as "not tried". The row has one bit — done or not — and a failure looks identical to a reminder whose time has not come.
+
+That is the actual defect: **the data model has no way to express "we tried and it did not work."**
+
+### The concept
+
+Two mechanisms, one problem:
+
+- **Record the outcome.** A failed attempt is an event that happened. If it leaves no trace, the question *"why did this not arrive?"* has no answer anywhere in the system.
+- **Wait longer each time.** Retrying instantly, forever, is not persistence — it is a denial-of-service against something that is already unwell.
+
+And the delay has to come from the database, not a timer. A timer lives in the process, and Stage 2 already settled what happens to things that live in the process.
+
+### Build
+
+- **7.1** the destination can fail: outcome becomes success-or-failure rather than nothing
+- **7.2** record the last failure on the row: what went wrong, and when
+- **7.3** back off: on failure, set the next time to try
+  - **7.3.1** the reminder is simply **not due** until then — which the existing `due_at <= now` query already handles. No new state, no new query, no new index
+  - **7.3.2** the delay is computed from stored values, never from an in-process timer
+
+### Persistence
+
+**Changed.** `last_error`, `attempted_at`, `next_attempt_at`.
+
+*Why the existing model is insufficient:* one boolean cannot distinguish "not yet" from "tried and failed".
+*What may force a change later:* **Stage 9 replaces all three.** `last_error` keeps only the most recent failure, and we are about to need every attempt. Flagged now so the replacement is expected rather than a surprise.
+
+### Tests
+
+- a failing send does not mark the reminder done
+- the failure and its time are recorded
+- it is not retried immediately — the next attempt is in the future
+- fail twice, then succeed: it is delivered, and the failures are still on the row
+- the backoff grows
+
+### Still broken
+
+The retry has no end.
+
+### Next question
+
+**Make the failure permanent.** Point it at a recipient that will never be valid, and leave it overnight.
+
+---
+
+# STAGE 8 — It retries forever
+
+| | |
+| --- | --- |
+| **Capability at the end** | a reminder that cannot be delivered reaches a visible, final state |
+| **Before this stage** | failures are recorded and backed off |
+| **Traces to** | **AC3** (second half) · CORRECTNESS_MODEL I-17, §15 · ANALYSIS §10.4 |
+
+### Break it
+
+```
+create a reminder for an address that is permanently invalid
+leave it running
+```
+
+### What happens
+
+Three days later it is still trying. The user's view has said *pending* the whole time.
+
+And a second, sharper observation: the very first failure already told us everything. "That recipient does not exist" is not going to become true in thirty seconds. We have been retrying a request whose answer cannot change.
+
+### Why
+
+Two different things were conflated into one word, *failure*:
+
+- **the world is unwell** — unreachable, timed out, overloaded. Might differ in thirty seconds.
+- **the request is wrong** — invalid recipient, malformed content. Will be identical on every retry.
+
+Retrying the first is correct. Retrying the second is pure waste — and worse, it *delays the moment the user finds out*, because the system keeps hoping instead of reporting.
+
+And separately: even legitimate retrying has to stop somewhere, or *pending* is a state a reminder can occupy permanently.
+
+### The concept
+
+**A budget, and a terminal state.**
+
+- Count attempts. When the count is spent, stop and say so.
+- Classify the failure. A request-shaped problem does not get a budget at all; it ends immediately.
+- Being wrong slowly is worse than being wrong quickly. A reminder nobody can deliver should *say so*, not hover.
+
+One detail that is easy to get wrong and expensive later: the budget must be **spent at the same moment the decision is made**. If the attempt count and the state are set by two separate writes, there is an instant where the count is spent but the reminder still looks schedulable — and it gets picked up forever. One write, or the loop comes back.
+
+### Build
+
+- **8.1** classify the outcome: *retryable* or *permanent*
+- **8.2** `attempt_count`, a `max_attempts`
+- **8.3** on a retryable failure: if budget remains, back off; otherwise stop
+- **8.4** on a permanent failure: stop immediately — do not spend the remaining budget
+- **8.5** a real terminal state, `failed`, with a reason recorded
+  - **8.5.1** *why a reason:* "out of retries" and "never going to work" need different responses from whoever reads the report
+- **8.6** the close and the decision are a **single write**
+
+### Persistence · state
+
+**Persistence:** `attempt_count`, `max_attempts`, `failure_reason`.
+
+**State:** the machine grows for the first time.
+
+```
+   before:   scheduled -> delivered
+   after:    scheduled -> delivered
+             scheduled -> failed
+```
+
+*Why the transition exists:* a reminder that cannot be delivered must stop being scheduled, or it is polled forever.
+*What enforces it:* the write that sets `failed` also spends the last of the budget.
+
+### Tests
+
+- three retryable failures → `failed`, reason `retries_exhausted`, exactly three attempts
+- one permanent failure → `failed` immediately, reason `permanent_error`, **one** attempt
+- a `failed` reminder is never picked up again
+- there is no moment where the budget is spent and the state is still scheduled
+- two retryable failures then a success → delivered, with the failures still in the record
+
+### Still broken
+
+All of this assumes the process survives long enough to write down what happened.
+
+### Next question
+
+**Kill it mid-send.**
+
+---
+# STAGE 9 — Did it send? And why did they get two?
+
+| | |
+| --- | --- |
+| **Capability at the end** | every send has a record written *before* it, and a repeat cannot become a second notification |
+| **Before this stage** | bounded retries, recorded failures |
+| **Rework** | Stage 7's `last_error` / `attempted_at` are **replaced** by an attempt table |
+| **Traces to** | **AC4** · CORRECTNESS_MODEL I-4, I-5, I-16 · ANALYSIS §5 |
+
+### Break it
+
+```
+make the destination slow
+kill -9 the process while the send is in flight
+start it again
+```
+
+### What happens
+
+Two problems from one experiment, and they are genuinely separate.
+
+**One:** the row says not-done. Did the notification go out or not? Look anywhere you like — there is no answer. The last thing we wrote was "not done yet", and the process died between the send and the write.
+
+**Two:** because we do not know, we retry. **The user gets it twice.**
+
+### Why
+
+The send leaves our world. A database transaction covers database rows; it does not cover a message already sitting on somebody's phone. Rolling back does not un-send anything, and keeping a transaction open across a network call just holds locks while the network is slow.
+
+So there is a gap between "we sent" and "we recorded it", and after a crash in that gap, **three different worlds look identical from inside our database:**
+
+```
+   A   the request never arrived
+   B   it arrived, and the acknowledgement was lost
+   C   it arrived and was acknowledged, and we died before writing
+```
+
+No amount of looking at our own storage separates them. This is not an implementation weakness to engineer away — it is the actual shape of the problem.
+
+Given that, there are only two strategies, and the choice is forced:
+
+| | covers | risks |
+| --- | --- | --- |
+| don't retry | no duplicates | world A — the promise is silently broken |
+| **retry** | world A | worlds B and C — a duplicate |
+
+**For a reminder, a duplicate beats a silent loss.** So we retry — which means retrying has to be made safe. And we just proved the safety cannot come from our side.
+
+### The concept
+
+Two mechanisms, and they solve different halves.
+
+**Write down that we are about to try, before we try.** This does not remove the uncertainty. It converts an unknown into a *known* unknown: after a crash, an attempt record with no ending means precisely *"a send may have happened"*. That is the difference between a system you can operate and one you cannot.
+
+**Give the thing a name the far side recognises.** If both presentations carry the same identifier, the destination can see the second as a repeat. We cannot stop sending twice; we can stop the second one from *counting*.
+
+Which leads to the only hard question in this stage: **the identifier for what, exactly?**
+
+- the *attempt*? No — attempts are what multiply. Every retry gets a new one, so every retry becomes a new notification, and the retry mechanism becomes the source of the duplication it exists to survive.
+- the *message text*? No — two genuinely different reminders that happen to say the same thing would collapse into one.
+- **the reminder** — the thing the far side should act on once. Yes, for now.
+
+That last answer is correct today and gets revisited at Stage 14, when the user edits.
+
+### Build
+
+- **9.1** an attempt record, replacing the `last_error` columns
+  - **9.1.1** opened **before** the send, with nothing filled in for the outcome
+  - **9.1.2** closed after, with what happened
+  - **9.1.3** an attempt left open means *"a send may have occurred"* — the record's whole purpose
+- **9.2** ordered history: every attempt, not just the last one
+  - **9.2.1** `list attempts` on the CLI, because *"why did this not arrive?"* is the question this table exists to answer
+- **9.3** a stable key on the send
+  - **9.3.1** derived from the reminder, stored once, **never recomputed at send time** — a later "improvement" to the derivation would silently change keys mid-retry
+- **9.4** a destination that recognises a repeat and reports it as one
+- **9.5** and separately, a destination that recognises **nothing**
+  - **9.5.1** *why both:* proving "we do not duplicate" against a destination that deduplicates proves nothing — the double absorbs exactly the bugs we are looking for. Our half of the claim is *"every presentation carried the same key"*, and that must hold against something that collapses nothing
+- **9.6** **no transaction is open across the send.** Commit, send, commit. This is a rule the shape of the code has to enforce, because no predicate can
+
+### Persistence
+
+**Changed, and this is the first real rework.** `last_error` / `attempted_at` are deleted; an `attempt` table replaces them.
+
+*Why the existing model is insufficient:* one column holds the most recent failure. We need every attempt, including ones that never finished.
+*What may force a change later:* Stage 12 adds a third way for an attempt to end; Stage 14 adds *which version* it belonged to.
+
+### Tests
+
+- **kill mid-send, restart → one notification** (the headline)
+- every presentation of one reminder carries an identical key — asserted against the **non**-deduplicating destination
+- an attempt record exists with no outcome after a crash
+- the record is written before the send: crash before the send returns, and the record is already there
+- ordering is stable — many attempts created in the same instant still read back in order
+
+### Still broken
+
+Something we have not looked at: the budget from Stage 8 is counted somewhere, and we just added a way to die without reaching that somewhere.
+
+### Next question
+
+**Do the same crash three times in a row.**
+
+---
+
+# STAGE 10 — The crash was free
+
+| | |
+| --- | --- |
+| **Capability at the end** | a crash costs an attempt, so a crashing system still terminates |
+| **Before this stage** | attempt records, stable keys, a retry budget |
+| **Rework** | *where* the budget is spent moves |
+| **Traces to** | CORRECTNESS_MODEL **F4**, **I-21** |
+
+### Break it
+
+```
+max attempts is 3
+kill -9 mid-send
+restart.  kill again.  restart.  kill again.
+```
+
+### What happens
+
+It is still going. Ten crashes later, it is still going.
+
+Check the attempt count: **zero.** The budget from Stage 8 has not moved once, while the destination has been presented with the same reminder ten times.
+
+### Why
+
+Stage 8 spent the budget where it seemed natural: at the point we *record what happened*. If we never reach that point, nothing is spent.
+
+Which is fine when a send fails — you get an answer, you write it down, the count goes up. It stops being fine now that there is a way to **die between trying and recording**, and Stage 9 is what introduced it.
+
+Sit with the shape of this for a second, because it generalises. Stage 8 bounded the retries and the bound was real. Stage 9 added a path that skips the accounting, and in doing so quietly un-bounded them again. **A mechanism can be correct and still be defeated by a later one that routes around it.**
+
+### The concept
+
+**Spend the budget when you commit to trying, not when you find out how it went.**
+
+The attempt record is already written *before* the send — that is Stage 9's whole point. Spend the budget in the same breath. Then dying mid-send costs exactly what failing mid-send costs, and a crash loop runs out of road.
+
+There is a price, and it is worth naming rather than discovering later: a crash between opening the record and the send actually leaving burns an attempt **for a send that never happened**. We cannot tell that case apart from a crash after the send left — they look identical in the database — so we charge for both.
+
+That is the conservative direction, chosen deliberately:
+
+> **Over-counting terminates. Under-counting loops forever.**
+
+Paying for a send that did not happen costs one wasted retry. Not paying for a send that did happen costs a loop with no end.
+
+### Build
+
+- **10.1** spend the budget in the same write that opens the attempt record
+- **10.2** remove the spend from the close path entirely — one place, not two
+- **10.3** the number of attempt records and the count must agree; nothing else may move either
+
+### Persistence
+
+No new columns. The same counter, moved.
+
+### Tests
+
+- **crash mid-send three times → the reminder reaches `failed`, not an infinite loop** (the headline; the mutation is to move the spend back to the close)
+- a crash before the send leaves burns an attempt — asserted deliberately, because it is a cost we chose
+- an ordinary failure still spends exactly one
+- the count and the number of attempt records never disagree
+
+### Still broken
+
+All of this still assumes **one** process doing the work.
+
+### Next question
+
+**Run two.**
+
+---
+
+# STAGE 11 — Both of them sent it
+
+| | |
+| --- | --- |
+| **Capability at the end** | two workers can run, and only one executes a given reminder |
+| **Before this stage** | attempt history, stable keys, a budget that crashes cannot dodge |
+| **Traces to** | CORRECTNESS_MODEL I-10 · ANALYSIS §8 |
+
+### Break it
+
+```
+start two copies of the loop against the same database
+create a reminder
+advance past its time
+```
+
+### What happens
+
+Both find it. Both send it.
+
+The destination collapses them, so **the user still gets one message** — Stage 9 already handled the effect. So what is actually wrong?
+
+Two things. Wasted work, which is merely annoying. And something worse: **two attempt records, two writers of the same row, and nothing deciding which one is in charge.**
+
+Today they write the same thing, so it looks fine. It stops looking fine the moment their writes differ — one recording success while the other records a failure and schedules a retry.
+
+### Why
+
+Finding work and doing work were never separated. Every worker that *sees* a reminder considers itself entitled to *execute* it.
+
+Note what is **not** the problem: the query returning the same row to both. That is fine and unavoidable — a read cannot exclude anybody. The problem is that nothing happens between reading and acting.
+
+### The concept
+
+**Discovering is not claiming.** A separate step where exactly one worker takes responsibility, and the others are told they did not.
+
+The mechanism is a conditional write: *"mark this as mine, but only if it is not already somebody's."* Both workers try; the database serialises them; one changes a row and one changes nothing. The loser is not an error — it just moves on.
+
+And a worker holding a reminder is a new situation the data model has no word for. It is not `scheduled` any more — nobody else should take it. It is not finished either.
+
+### Build
+
+- **11.1** a `running` state — someone has this
+- **11.2** a claim: one conditional write that moves `scheduled` → `running`, only if it is still `scheduled`
+  - **11.2.1** the result is *"did I get it?"* — one row changed, or none
+  - **11.2.2** the discovery query already excludes `running`, so a claimed reminder disappears from everyone else's view
+- **11.3** losing a claim costs nothing: no rollback, no backoff, carry on to the next candidate
+- **11.4** on finishing, move out of `running`
+
+### State
+
+```
+   scheduled -> running -> delivered
+             -> running -> failed
+```
+
+*Why:* "somebody is working on this" had no representation.
+*What enforces it:* the claim's own predicate — `WHERE state = 'scheduled'`.
+
+### Tests
+
+- two workers, one reminder, **one** claim succeeds and one changes nothing
+- one send, not two
+- a claimed reminder is invisible to the discovery query
+- a worker that loses a claim carries on to the next item without error
+
+### Still broken
+
+Nothing says how long a claim lasts.
+
+### Next question
+
+**Kill the worker while it is holding one.**
+
+---
+
+# STAGE 12 — Stuck forever, and a record with no ending
+
+| | |
+| --- | --- |
+| **Capability at the end** | a reminder abandoned by a dead worker is picked up, and its half-written history is closed honestly |
+| **Before this stage** | claiming works |
+| **Rework** | the claim gains an expiry; the attempt record gains a third possible ending |
+| **Traces to** | CORRECTNESS_MODEL I-2, I-11, I-16, §8 · ANALYSIS §14.3 |
+
+### Break it
+
+```
+worker A claims a reminder
+kill -9 worker A mid-send
+watch worker B
+```
+
+### What happens
+
+Two things, one obvious and one only visible if you look at the history.
+
+**The reminder sits in `running` forever.** Worker B never touches it. It never fires and it never fails — it simply stops, in a state that looks like progress.
+
+**And worker A's attempt record has no ending.** It was opened before the send, as Stage 9 requires, and nobody ever closed it. It will sit there, half-written, indefinitely.
+
+### Why
+
+**The claim recorded that *someone took it*. It never recorded that *someone still has it*.**
+
+There is no difference, in the database, between "a worker is actively sending this right now" and "a worker died forty minutes ago". Both look like `running`. This is the worst kind of stuck: the state says work is happening, so nothing raises an alarm and no report counts it as a failure.
+
+The open record is the same problem seen from the history's side. Stage 9 made "we might have sent" visible on purpose — but only the worker that opened it was ever expected to close it, and that worker is gone.
+
+Which forces a question with a genuinely uncomfortable answer: **how do we know the worker is dead?**
+
+We do not. A worker frozen by a long pause and a worker that was killed leave exactly the same trace. Any attempt to tell them apart needs a heartbeat, and a heartbeat can be late for the same reasons the work can be late.
+
+So we stop trying to know. The expiry does not mean "the worker is dead". It means **"we are no longer willing to wait"** — which is a decision we can actually make.
+
+### The concept
+
+**A claim expires**, and **taking over closes what the previous holder left open.**
+
+The second half needs its own honest answer. What outcome do we record for an attempt nobody ever finished? Not success — we do not know that. Not failure — we do not know that either. The truthful answer is a third thing: **we never found out.**
+
+That is not a placeholder to be tidied up later. It is permanent. We will never learn which of Stage 9's three worlds that attempt was in, and a record that later claims otherwise would be inventing knowledge.
+
+One thing that does *not* need doing, and it is a nice payoff from the previous stage: the budget for that abandoned attempt was already spent when it was **opened**. There is nothing to reconcile. Had Stage 10 gone the other way, a takeover would now have to decide whether to charge for it.
+
+### Build
+
+- **12.1** the claim records when it expires
+- **12.2** discovery gains a second question: anything `running` whose claim has expired
+- **12.3** taking over is the same conditional write, with a different condition
+- **12.4** the expiry uses the injected clock, and is **wall-clock time stored in the row** — a duration measured inside one process means nothing to a different process reading that row later
+- **12.5** taking over also closes any attempt record the previous holder left open
+  - **12.5.1** recorded as *we never found out*, and never revised afterwards
+  - **12.5.2** it happens in the same write as the takeover, so there is no moment where the reminder has a new owner and a dangling record from the old one
+
+### Persistence · state
+
+**Persistence:** `claimed_until`, who claimed it, and a third possible outcome on the attempt record.
+
+**State:** no new item state — a takeover is `running` → `running`. Ownership changed; the reminder's own situation did not. Worth noticing, because it is the first hint that *who owns this* and *what state is this in* are two different things.
+
+### Tests
+
+- kill a worker mid-claim → another takes over after the expiry, not before
+- a live worker's claim is **not** taken — the expiry is respected in both directions
+- **the dead worker's attempt record is closed, as *we never found out*** — the mutation is to skip that write
+- the record is never later rewritten to success or failure
+- the reminder is eventually delivered despite the crash
+- the expiry survives a restart of everything
+
+### Still broken
+
+We just said the expiry does not mean the worker is dead. So what happens when it is not?
+
+### Next question
+
+**Make the send take longer than the claim lasts.**
+
+---
+
+# STAGE 13 — The slow one came back and overwrote the new one
+
+| | |
+| --- | --- |
+| **Capability at the end** | a worker that has been replaced cannot change anything |
+| **Before this stage** | claims expire; abandoned history is closed |
+| **Rework** | every worker write gains a condition |
+| **Traces to** | CORRECTNESS_MODEL **F1** (the critical finding), I-12, I-20 · ARCHITECTURE §9, §0.6 |
+
+### Break it
+
+```
+claim lasts 30 seconds
+make the send take 40
+```
+
+### What happens
+
+```
+  12:00:00   A claims it, starts sending
+  12:00:30   the claim expires        <-- A is ALIVE, still sending
+  12:00:31   B takes over, sends, records it delivered
+  12:00:40   A finishes, and records it delivered too
+```
+
+A wrote over a job that stopped being its own ten seconds earlier.
+
+Today both wrote `delivered`, so the damage is invisible. Change one variable — A's send *failed* while B's succeeded — and A turns a delivered reminder back into a scheduled one.
+
+### Why
+
+The expiry was a decision *we* made. Nobody told A. A has no idea it was replaced, and no way to find out, because nothing it does requires it to check.
+
+The claim answered *"may I take this?"* It never answered **"am I still the one holding it?"** — and that is a question every single write needs to ask, not just the first one.
+
+### The concept
+
+**Give each claim a number that only ever goes up.**
+
+```
+   A claims   ->   #101
+   expires
+   B claims   ->   #102        the counter moved
+```
+
+Every write a worker makes carries its number, and the write only lands if that number is still the current one. A comes back holding `#101`, the row says `#102`, and **A's write matches nothing.**
+
+A is not notified. It does not need to be. It finds out the only way that is sound: by writing and being told nothing changed.
+
+Two consequences worth stating, because they are the payoff for this whole chapter:
+
+**The question we could not answer stops mattering.** We never needed to know whether A was dead or slow. We needed A's writes to be ignored once it was replaced — a different and answerable thing.
+
+**The claim duration stops being dangerous** — with one caveat, below.
+
+### Build
+
+- **13.1** a number on the row, incremented by every claim
+- **13.2** the claim hands that number back to the worker
+- **13.3** **every** write a worker makes carries it
+  - **13.3.1** enumerate them. Not just "mark delivered" — also marking failed, also putting it back for a retry, also releasing it
+  - **13.3.2** the release is the dangerous one, and the least obvious. If a replaced worker can put the reminder back while the current worker is still sending, a **third** worker picks it up — three sends, not two
+- **13.4** a worker whose write matches nothing stops quietly and records nothing about the reminder
+
+### The caveat, stated rather than discovered later
+
+It is tempting to conclude *"the claim duration can now be anything."* That is half right, and the half that is wrong matters.
+
+**Safety** is genuinely unaffected: at any duration, no replaced worker can corrupt anything.
+
+**Outcomes** are not. A takeover closes the previous attempt as *we never found out* (Stage 12), and that attempt already spent budget (Stage 10). So a claim shorter than the work it guards burns the budget on takeovers rather than on real failures — and a perfectly healthy reminder can reach `failed` having never had a real problem.
+
+The accurate statement is therefore: **the claim duration is safety-neutral but not outcome-neutral.** What contains it is keeping the send's own deadline comfortably shorter than the claim, so live workers are rarely replaced in the first place.
+
+### Tests
+
+- the replaced worker's `delivered` write changes **nothing**
+- the replaced worker's *release* changes nothing — the three-worker scenario
+- the current worker's writes all still land
+- **run the suite at several claim durations and assert the safety properties hold at every one** — no corrupted state, no second notification
+- and, separately, **assert the coupling above rather than denying it**: with a claim shorter than the send and a destination that never fails, a reminder exhausts its budget on takeovers alone
+- deleting the number from any one write makes a specific test fail — one mutation per write path
+
+### Still broken
+
+Every guard so far protects workers from each other. Nothing protects against **the user**.
+
+### Next question
+
+**Edit the reminder while a worker is sending it.**
+
+---
+# STAGE 14 — It delivered the old message
+
+| | |
+| --- | --- |
+| **Capability at the end** | a reminder can be changed before it fires, safely, even mid-send |
+| **Before this stage** | fenced claims; workers cannot overwrite each other |
+| **Rework** | the reminder table is **split in two**; the key changes shape |
+| **Traces to** | **AC5** · CORRECTNESS_MODEL §3.1, I-7, I-9, I-19 · ARCHITECTURE §4, §7.2 |
+
+### Break it
+
+Three separate experiments; each one breaks something different.
+
+```
+a)  worker starts sending  ->  user changes the text  ->  worker finishes
+b)  two people open the same reminder and both change it
+c)  change only the TEXT, leave the time alone
+```
+
+### What happens
+
+**(a)** The reminder is recorded as delivered — with the text the user just replaced. No claim expired. Nobody was replaced. The worker still holds the current number, so its write is accepted.
+
+**(b)** The second save silently overwrites the first. The first person gets a cheerful confirmation for a change that no longer exists. Nothing errors.
+
+**(c)** The corrected message goes out and the destination says *"already handled."* **The correction never arrives.**
+
+### Why
+
+**(a) is the important one.** Stage 12's number answers *"was I replaced?"* Nobody replaced A — so it answers *no*, correctly, and lets the write through. It has no opinion about the user, because it never moves when the user does anything.
+
+These two look identical from the outside — a worker finishing late, holding something out of date — and each is caught by a guard that is completely blind to the other:
+
+```
+   claim expires, user does nothing      the number moved, nothing else did
+   user edits, nobody was replaced       nothing moved except the user's intent
+```
+
+They change on **different events**. So there is always a case where one is current and the other is stale, in both directions. Neither can stand in for the other.
+
+**(c) is the same realisation applied to the key.** At Stage 9 we named the key after "the reminder", which was right when a reminder had one meaning forever. Now it has several over time, and the far side needs to tell them apart.
+
+And underneath all three, **(a) has a second half people miss.** Editing does not just make the worker's *intent* stale — it rewrites the row the worker resolved from. The instant moves while a worker is mid-send against the old one.
+
+### The concept
+
+**Intent has a version, and a version's facts never change.**
+
+- a number that moves when the *user* changes something, checked by every worker write alongside the claim number
+- an edit must say which version it was working from, and is refused if that is no longer current — otherwise two people editing means one of them silently loses
+- the key includes the version, so a new intent is a new thing to deliver
+- and the facts belonging to a version — the time, the text, the key — move somewhere **nothing can overwrite them**
+
+That last one is a schema change, and it is the interesting one. The fix for "an edit rewrites the row underneath a worker" is not a rule saying *don't overwrite those columns* — a rule is something a person has to remember. It is to put those facts in a table that **has no update statement anywhere in the codebase**. An edit can then only append a new row and move a pointer.
+
+Which also means older versions survive, and that turns out to matter at Stage 15.
+
+### Build
+
+- **14.1** a `version` on the reminder, starting at 1, incremented by an accepted edit
+- **14.2** split the table
+  - **14.2.1** `reminder` keeps what changes — state, claim, the version pointer
+  - **14.2.2** a new insert-only table keeps what must not — local time, zone, instant, text, key. One row per version
+  - **14.2.3** no update statement against it, ever. A test greps for one
+- **14.3** `edit` takes the version it is based on, and is refused if that is stale
+  - **14.3.1** required, not optional — one caller omitting it reintroduces the silent overwrite for everybody
+  - **14.3.2** the refusal comes back with the current version, so the caller can re-read and retry
+- **14.4** `version` joins the claim number in every worker write
+- **14.5** the key is derived from the reminder **and its version**
+- **14.6** an edit resets the retry budget — a new intent gets a fair chance
+
+### Persistence · state
+
+**Persistence:** one table becomes two. `version` added. The key moves.
+
+**State:** `running` → `scheduled` on edit — a running claim is now for a version that no longer matters.
+
+### Tests
+
+- edit mid-send → the item is **not** marked delivered, and the record shows what was sent
+- **the pair that proves neither guard substitutes for the other:**
+  - claim expires, nobody edits → the version check would have let it through; the number catches it
+  - user edits, nobody replaced → the number check would have let it through; the version catches it
+- two concurrent edits → one succeeds, one is refused with the current version
+- **a text-only edit is delivered** — the failure from (c). The mutation is to drop the version from the key
+- the instant of a superseded version is still readable, unchanged
+- a superseded version's successful send can never become this reminder's delivery
+
+### Still broken
+
+If the notification already left before the edit landed, it is **gone**. It is on somebody's phone. No condition in a database reaches into the world and takes it back.
+
+What we guarantee is narrower and worth stating precisely: it is not *recorded* as a delivery of current intent, and the history says exactly what was sent and for which version. The reminder shows as scheduled at the new time, with a successful attempt against the old one in its record.
+
+That gap between what happened and what the item says is not a bug. It is information — and the next stage is where it gets its sharpest test.
+
+### Next question
+
+**Cancel it while a worker is sending.**
+
+---
+
+# STAGE 15 — Cancelled, and the history hangs open
+
+| | |
+| --- | --- |
+| **Capability at the end** | a reminder can be stopped before it commits, and the record stays truthful |
+| **Before this stage** | versioned intent, immutable per-version facts |
+| **Traces to** | **AC6** · CORRECTNESS_MODEL I-8, I-16, §16 · ARCHITECTURE §0.5 |
+
+### Break it
+
+```
+a)  worker starts sending  ->  user cancels  ->  worker finishes successfully
+b)  worker starts sending  ->  user cancels  ->  kill -9 the worker
+```
+
+### What happens
+
+**(a)** Depending on which write lands second, the reminder can end up **cancelled but recorded as delivered** — the one outcome a user would call a bug without hesitating.
+
+**(b)** The reminder is cancelled. The attempt record from the killed worker is still **open**, with no ending, and it stays that way **forever**.
+
+### Why
+
+**(a)** Every guard so far asks *"is this still current?"* — is my claim current, is my version current. None of them asks *"has this already finished?"* Cancelling makes the reminder finished, and nothing in the worker's write path notices.
+
+Worth being precise about what is achievable here, because it is easy to over-promise. If the send already left, the notification exists. The guarantee is not *"cancelling stops the message"* — nothing can do that. It is *"cancelling stops the message from being recorded as a delivery."*
+
+**(b)** is subtler and much easier to miss. The open attempt is normally closed by whoever takes the reminder over next — that is how every abandoned attempt since Stage 12 gets cleaned up. But a cancelled reminder **can never be taken over again**, by design. So nothing will ever reach that record.
+
+Cancellation turns out to be the only ending that is both caused by somebody other than the worker *and* not preceded by a takeover. Every other path either closes the record itself or leaves the reminder claimable.
+
+### The concept
+
+**Finished means finished, for everybody — and history still has to be closed.**
+
+- a state a worker's writes must never be able to leave. Every worker write starts asking *"is this still running?"*, alongside the two questions it already asks
+- **cancelling does not take a version.** An edit is a revision of a specific earlier state, so it needs to know which one. A cancellation is version-free: *"I do not want this, whatever it currently says."* Requiring a version would refuse a legitimate cancellation just because somebody else edited first — the worst possible failure for the one operation whose entire job is to stop a notification
+- and something has to close records that no takeover will ever reach — **but not immediately.** The worker may yet come back with a real answer, and that answer is better than a guess. So: wait as long as a takeover would have waited, then close it as *we never found out*
+
+### Build
+
+- **15.1** a `cancelled` state, reachable from `scheduled` and from `running`
+- **15.2** cancel is one conditional write: only if it has not already finished
+  - **15.2.1** no version required
+  - **15.2.2** cancelling an already-cancelled reminder succeeds quietly; a client retrying after a network failure must not be told it failed when its intent is already satisfied
+  - **15.2.3** cancelling a delivered one is refused, and says so — that is a *different* ending and hiding it would be the worst possible silence
+- **15.3** every worker write adds *"is this still running?"*
+- **15.4** a sweep for attempt records nothing will ever reach
+  - **15.4.1** which ones: the reminder is finished, **or** the attempt belongs to a version that has been superseded
+  - **15.4.2** only after a takeover's worth of time has passed, so the owner keeps its chance to report the truth
+  - **15.4.3** closed as *we never found out*, marked with who closed it — a record closed by a sweep means something different from one closed by its owner, and they call for different responses
+
+### State
+
+All five states now exist.
+
+```
+   scheduled -> running -> delivered
+             -> running -> failed
+             -> cancelled
+                running -> cancelled
+```
+
+### Tests
+
+- cancel before a claim → nothing is ever sent
+- cancel mid-send → the item is `cancelled`, the send is recorded as having **happened**, and the item is **not** delivered
+- delivered first, then cancel → the cancel is refused
+- **no cancelled reminder is left with an open attempt record** — the mutation is to delete the sweep
+- the sweep does not pre-empt a worker that comes back in time
+- a worker whose reminder was cancelled can still record its own outcome — it just cannot touch the reminder
+
+### Still broken
+
+Nothing correctness-shaped that we know of. What is missing is reach: all of this is driven from one terminal.
+
+### Next question
+
+Something other than a CLI needs to create these.
+
+---
+
+# STAGE 16 — Something other than a CLI needs it
+
+| | |
+| --- | --- |
+| **Capability at the end** | create, read, edit, cancel and inspect history over HTTP |
+| **Before this stage** | the full correctness model, driven from a terminal |
+| **Traces to** | ARCHITECTURE §16 |
+
+### An honest label
+
+**This stage is not failure-driven, and pretending otherwise would be the exact dishonesty we reset to avoid.** No experiment produces a bug that an HTTP API fixes. It is a capability: a conversational companion has to call this from somewhere.
+
+It is late for a practical reason rather than a principled one. Create, edit and cancel changed shape at Stages 5, 8, 13 and 14. An interface built over moving semantics is rebuilt four times; built over settled ones it is mechanical.
+
+One thing here *is* failure-shaped, and it is small: a client whose request times out and retries **creates two reminders**. We spent Stage 9 demanding that the far side recognise a repeat; offering nothing equivalent to our own callers applies the principle in one direction only.
+
+### Build
+
+- **16.1** FastAPI + Pydantic models over the existing services — in-process, no new logic
+- **16.2** create · get · edit · cancel · list attempts · list versions
+- **16.3** the responses carry what the user needs and would not otherwise learn
+  - **16.3.1** creating `02:30` on a spring-forward date returns *which* case it hit and what it became — told at the time, not discovered when it arrives an hour late
+  - **16.3.2** a refused edit returns the current version, so a retry is possible
+  - **16.3.3** the attempt history is an endpoint, because *"why did this not arrive?"* is the question the whole record exists to answer
+- **16.4** optional client-supplied request id, so a retried create returns the original instead of making a second reminder
+- **16.5** **no clock-control endpoint.** The clock is a constructor argument; a `/advance-clock` route would be a production backdoor whose existence is itself a defect
+
+### Tests
+
+- each endpoint's success shape
+- a refused edit returns 409 and the current version
+- a retried create with the same request id returns the original; with a different body, it is refused
+- **no route reads or writes the clock**
+
+---
+
+# STAGE 17 — All of it at once
+
+| | |
+| --- | --- |
+| **Capability at the end** | one command that exercises every mechanism together and reports what happened |
+| **Before this stage** | every mechanism built, each proven alone |
+| **Traces to** | the brief's verification benchmark · BUILD_PLAN §Definition of done |
+
+### Why this is last, and why it is not where correctness is first tested
+
+Every mechanism arrived with a test that fails without it. This stage tests **interactions** — a takeover during a retry during a cancellation storm — which is a different thing and only possible once the parts exist.
+
+If most of the correctness testing happened here, the previous sixteen stages were a component checklist wearing a story.
+
+### Build
+
+- **17.1** the acceptance scenarios, end to end
+- **17.2** the benchmark: 20+ reminders, two zones, delivered / edited / cancelled / temporarily failing / permanently failing, a **real process kill** partway through, a forced duplicate, the clock advanced until everything settles
+- **17.3** the report: counts by final state, attempt outcomes, how many repeats the far side absorbed
+- **17.4** the assertion that matters most — **no key ever produced more than one notification**
+- **17.5** the honest assertion — count the sends that escaped before a cancel or an edit landed, and check the count is *exactly the ones we arranged*. Not zero. Zero is not achievable, and claiming it would be a lie the record can disprove
+- **17.6** re-run at a deliberately terrible claim duration and check the safety properties are unchanged
+- **17.7** `SUBMISSION.md` — the decisions, and the limits
+
+### The sentence the submission has to contain
+
+> Execution is at-least-once. The observable effect is exactly-once, enforced by a stable per-occurrence key deduplicated at the delivery boundary. Exactly-once *execution* is not claimed, because it is not achievable across a boundary that cannot participate in our transaction.
+
+---
+
+## What gets built more than once
+
+Listed so it is never a surprise, and so the reason is on the record.
+
+| Built at | Replaced at | Why the first version was worth building |
+| --- | --- | --- |
+| in-memory list (1) | SQLite (2) | you cannot feel why durability matters until something vanishes |
+| load at boot (2) | poll the store (3) | the natural first move, and it teaches that the store is the truth |
+| windowed query (3) | `due_at <= now` (4) | "what's new since I last looked" is how a loop thinks, and it is the wrong question |
+| a UTC instant from the caller (1) | local time + zone (5) | until two people in two cities try it, the problem is invisible |
+| `last_error` column (7) | attempt table (9) | one column is obviously enough, until a crash leaves you needing every attempt |
+| the key names the reminder (9) | it names reminder + version (13) | correct until a reminder can mean more than one thing over time |
+| claim flag (10) | claim with expiry (11) | it works, right up until the holder dies |
+| expiry alone (11) | expiry + number (12) | it recovers from dead workers, and lets live slow ones corrupt things |
+| one mutable table (2-13) | reminder + versions (14) | the split is only justified once an edit has to not move the ground |
+
+**None of these is a mistake corrected.** Each is a correct answer to the question that had been asked so far, replaced when a new question arrived. That is the record of how the final architecture is derived rather than copied — and it is what makes it explainable to somebody who was not here.

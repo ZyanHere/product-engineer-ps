@@ -1,0 +1,70 @@
+"""Stage 1 — a reminder fires.
+
+Three tests, one per thing that could go wrong at this size: it fires too
+early, it never fires, or it fires more than once.
+
+Every one of them states the instant it runs at. Nothing here waits for real
+time, and nothing reads the system clock -- `now` is an argument.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+from reminders.core import Reminders
+
+DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
+
+
+def test_does_not_fire_before_its_time() -> None:
+    reminders = Reminders()
+    reminders.create(DUE_AT, "Call the clinic")
+
+    assert reminders.tick(DUE_AT - timedelta(minutes=1)) == []
+
+
+def test_fires_at_its_time() -> None:
+    reminders = Reminders()
+    created = reminders.create(DUE_AT, "Call the clinic")
+
+    fired = reminders.tick(DUE_AT)
+
+    assert [r.id for r in fired] == [created.id]
+    assert created.done is True
+
+
+def test_fires_exactly_once() -> None:
+    """A second tick does nothing -- the flag is what stops it.
+
+    Without this, every tick after the due time would fire the reminder again:
+    a busy loop that looks like healthy operation.
+    """
+    reminders = Reminders()
+    reminders.create(DUE_AT, "Call the clinic")
+
+    assert len(reminders.tick(DUE_AT)) == 1
+    assert reminders.tick(DUE_AT + timedelta(days=30)) == []
+
+
+def test_an_overdue_reminder_still_fires() -> None:
+    """`due_at <= now`, not `== now`.
+
+    A reminder is owed from its instant onwards, not only at the exact moment
+    somebody happened to look. This costs one character and it is the reason
+    Stage 4's problem is about a query window rather than about this.
+    """
+    reminders = Reminders()
+    reminders.create(DUE_AT, "Call the clinic")
+
+    assert len(reminders.tick(DUE_AT + timedelta(hours=6))) == 1
+
+
+def test_fires_in_due_order() -> None:
+    reminders = Reminders()
+    reminders.create(DUE_AT + timedelta(hours=2), "third")
+    reminders.create(DUE_AT, "first")
+    reminders.create(DUE_AT + timedelta(hours=1), "second")
+
+    fired = reminders.tick(DUE_AT + timedelta(hours=3))
+
+    assert sorted(r.text for r in fired) == ["first", "second", "third"]

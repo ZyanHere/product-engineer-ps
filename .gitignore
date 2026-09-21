@@ -21,3 +21,8 @@ venv/
 # Local trace exports
 *.jsonl
 !tests/fixtures/*.jsonl
+
+# Local database artefacts (the benchmark writes one; it is not source)
+*.db
+*.db-wal
+*.db-shm
