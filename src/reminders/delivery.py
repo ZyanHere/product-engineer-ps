@@ -32,6 +32,24 @@ unwell without the work being lost.
 An adapter's job is to translate. A real HTTP sender catches its client's
 timeouts and connection errors and re-raises them as `DeliveryError`; what it
 must not do is blanket-catch and swallow.
+
+Stage 8: who knows whether it is worth trying again
+--------------------------------------------------
+Not us. "The connection was refused" and "there is no such recipient" arrive
+here as the same Python exception, and from inside this process they are
+indistinguishable -- yet one of them will be a different answer in thirty
+seconds and the other will be the same answer forever.
+
+The only code that can tell is the code that spoke to the destination: it saw
+the 503 or the 422, the DNS failure or the rejected address. So the judgement
+belongs in the exception the adapter raises, and `PermanentDeliveryError` is how
+it says *do not bother asking again*.
+
+**Retryable is the default**, by subclassing rather than by a flag. An adapter
+that forgets to classify something produces a retryable failure, which wastes
+requests and delays the bad news. The other default -- unknown means permanent
+-- would silently abandon deliverable reminders during an ordinary outage, and
+that is a much worse thing to get wrong by omission.
 """
 
 from __future__ import annotations
@@ -45,18 +63,38 @@ __all__ = [
     "Destination",
     "DeliveryError",
     "FlakyDestination",
+    "InvalidRecipientDestination",
     "NullDestination",
+    "PermanentDeliveryError",
     "PrintDestination",
     "RefusingDestination",
 ]
 
 
 class DeliveryError(Exception):
-    """The destination did not accept the reminder.
+    """The destination did not accept the reminder, and might next time.
 
-    Deliberately says nothing about *why*, and in particular nothing about
-    whether retrying is worth it. Stage 8 is where a failure first has to be
-    asked "is this ever going to work?".
+    The unwell-world case: unreachable, timed out, overloaded, refused. Worth
+    asking again, because the answer can change.
+
+    This is the base class, so it is also what an adapter raises when it has
+    not thought about the question. See the module docstring for why that
+    default is the safe one.
+    """
+
+
+class PermanentDeliveryError(DeliveryError):
+    """The request itself is wrong, and will be just as wrong on every retry.
+
+    No such recipient, malformed content, rejected address. The answer the
+    destination gave on the first attempt is the final answer, and continuing to
+    ask does two bad things: it wastes requests, and -- the one that actually
+    matters -- it **delays the moment the user finds out**, because the system
+    goes on hoping instead of reporting.
+
+    A subclass, so `except DeliveryError` still catches it. The dangerous shape
+    would be the reverse: a sibling class that an older `except DeliveryError`
+    silently lets escape.
     """
 
 
@@ -111,6 +149,21 @@ class RefusingDestination:
     def send(self, reminder: Reminder) -> None:
         self.attempts += 1
         raise DeliveryError(self._reason)
+
+
+class InvalidRecipientDestination:
+    """Says no, once, and means it. The address is not going to become valid.
+
+    The Stage 8 break, shipped: `--destination invalid`.
+    """
+
+    def __init__(self, reason: str = "no such recipient: nobody@invalid") -> None:
+        self._reason = reason
+        self.attempts = 0
+
+    def send(self, reminder: Reminder) -> None:
+        self.attempts += 1
+        raise PermanentDeliveryError(self._reason)
 
 
 class FlakyDestination:

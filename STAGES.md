@@ -713,9 +713,19 @@ leave it running
 
 ### What happens
 
-Three days later it is still trying. The user's view has said *pending* the whole time.
+*Measured, not imagined.* Three days of virtual time against a permanently invalid recipient:
 
-And a second, sharper observation: the very first failure already told us everything. "That recipient does not exist" is not going to become true in thirty seconds. We have been retrying a request whose answer cannot change.
+```
+three days later
+  attempts:            81
+  state the user sees: waiting
+  last error:          no such recipient: nobody@invalid
+  next try:            2026-03-12T13:25:15+00:00
+```
+
+Still trying, and the user's view has said *waiting* the whole time — so the system's honest summary of something impossible is *"still coming"*.
+
+And a second, sharper observation, visible in the same output: the very first failure already told us everything. "That recipient does not exist" is not going to become true in thirty seconds. The answer on attempt 1 was the answer on attempt 81, and it was still scheduled to ask again.
 
 ### Why
 
@@ -747,6 +757,9 @@ One detail that is easy to get wrong and expensive later: the budget must be **s
 - **8.5** a real terminal state, `failed`, with a reason recorded
   - **8.5.1** *why a reason:* "out of retries" and "never going to work" need different responses from whoever reads the report
 - **8.6** the close and the decision are a **single write**
+  - **8.6.1** *as built:* no behavioural test can see between two commits, so this one is checked by watching the SQL the store actually runs — `Store.trace()` exists for exactly that and nothing else. The mutation that splits the statement in two is caught, which is the only evidence that matters
+- **8.7** *added while building:* `max_attempts` is **copied onto the row**, not read from the constant when a failure happens
+  - **8.7.1** the plan listed the column without saying why one was needed. The reason is a deploy: lower a shared default from five to three and every reminder already on its fourth attempt becomes `failed` the moment the new process starts — a terminal decision about somebody's reminder, taken by a config change nobody connected to it. On the row, a reminder is judged by the rules it was made under
 
 ### Persistence · state
 
@@ -763,6 +776,10 @@ One detail that is easy to get wrong and expensive later: the budget must be **s
 *Why the transition exists:* a reminder that cannot be delivered must stop being scheduled, or it is polled forever.
 *What enforces it:* the write that sets `failed` also spends the last of the budget.
 
+`done` is **deleted**, not kept alongside. It could express "it worked" and "not yet"; there is now a third thing a reminder can be, and a boolean forced that third case to hide inside "not yet" — which is precisely how an invalid recipient spent three days looking like it was still coming.
+
+One consequence worth stating: `state = 'scheduled'` enters the due-query here and *not earlier*. A `done = 0` test said the same thing while there were two outcomes. Now there are three, two of them endings, and the same clause excludes a `failed` row as excludes a delivered one — so "it is never picked up again" is a property of the query rather than something the caller has to remember.
+
 ### Tests
 
 - three retryable failures → `failed`, reason `retries_exhausted`, exactly three attempts
@@ -774,6 +791,18 @@ One detail that is easy to get wrong and expensive later: the budget must be **s
 ### Still broken
 
 All of this assumes the process survives long enough to write down what happened.
+
+Three smaller holes, named rather than fixed:
+
+- **Nothing ties `failure_reason` to `state = 'failed'`.** The code only ever writes them together, but the schema would accept a `scheduled` row with a reason on it. A `CHECK` constraint is the fix and it has no failure behind it yet.
+- **`attempt_count` counts what *we* did, not what the destination saw.** They are the same number only while every send either clearly worked or clearly did not. Stage 9 introduces the third answer.
+- **The poll interval is still only latency.** A long interval delays the moment the budget runs out but cannot change *which* terminal state is reached, because the budget is a count and not a deadline. Stage 13 is where a timing parameter first decides an outcome.
+
+### Rework this stage caused
+
+Three Stage 7 tests now pass an enormous `max_attempts`. They were written when the retry had no ending, so they never said how long they expected it to go on — and without the override they would be measuring the *budget* instead of the *backoff*. This is rule 3 working as intended: the retrofit is small and it makes each test say out loud what it is actually asking.
+
+One incidental lesson, worth keeping because it will happen again: the first draft of the Stage 8 tests ran to a three-day horizon at a one-second poll, because that is what the break script did. That is 259,000 laps of a loop whose answer was already `[]`, and one test took 32 seconds. **The fake clock makes a long span possible, not free.**
 
 ### Next question
 

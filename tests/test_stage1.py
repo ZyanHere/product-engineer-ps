@@ -58,7 +58,7 @@ def test_fires_at_its_time() -> None:
     fired = reminders.tick(DUE_AT)
 
     assert [d.reminder.id for d in fired] == [created.id]
-    assert [r.done for r in store.load_all()] == [True]
+    assert [r.state for r in store.load_all()] == ["delivered"]
 
 
 def test_fires_exactly_once() -> None:

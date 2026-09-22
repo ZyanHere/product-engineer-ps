@@ -40,6 +40,14 @@ The poll interval is now also the **floor** on a retry gap: a backoff of five
 seconds under a sixty-second poll is a sixty-second wait. That is a rounding
 error in favour of waiting longer, which is the safe direction -- it can only
 ever hit the destination less often than asked, never more.
+
+Stage 8 note: still only latency
+--------------------------------
+Stage 8 gave a reminder a way to end in `failed`, which is the first time this
+parameter could plausibly have decided an *outcome*. It does not. A long interval
+delays the moment the budget runs out; it cannot change which terminal state is
+reached, because the budget is a **count** and not a deadline. Stage 13 is where
+that stops being true.
 """
 
 from __future__ import annotations

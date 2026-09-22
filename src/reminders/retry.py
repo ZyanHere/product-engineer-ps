@@ -21,23 +21,44 @@ delay is `next_attempt_at - attempted_at`: two columns, both on the row. Nothing
 here can consult a counter that does not survive a restart, because there is
 nowhere to put one.
 
-Deliberately not here
----------------------
+Stage 8 adds the other half
+---------------------------
+The gap growing forever is not the same as giving up. Left alone for three days
+against a permanently invalid recipient, Stage 7 produced this:
+
+    attempts:            81
+    state the user sees: waiting
+    last error:          no such recipient: nobody@invalid
+    next try:            2026-03-12T13:25:15+00:00
+
+Two faults in one line. The polite backoff meant the answer from attempt 1 was
+still being re-requested on attempt 81 -- and `waiting` is not a state a
+reminder should be able to occupy permanently. *Being wrong slowly is worse than
+being wrong quickly*, because nobody can act on a reminder that is still
+hoping.
+
+So: a budget, and something for a spent budget to mean. `MAX_ATTEMPTS` below;
+the terminal state is in `core.py`, because the interesting part is not the
+number, it is that reaching it has to be a decision the store records.
+
+Deliberately still not here
+---------------------------
 **Jitter.** Spreading retries randomly stops a crowd of reminders that failed
 together from marching back in lockstep. That is a real effect and this will
 eventually need it -- but nothing in this system has ever had a crowd, so
 adding it now would be a fix with no failure behind it. It belongs with Stage
 17, where enough load exists to actually show the lockstep.
 
-**A cap on the number of tries.** This grows the gap forever and never gives
-up, which is Stage 8's problem to have.
+**Any notion of what a failure *costs*.** Stage 10 finds a way to die that
+spends no budget at all, and that is where "what counts as an attempt" stops
+being obvious.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-__all__ = ["FACTOR", "FIRST_DELAY", "MAX_DELAY", "next_delay"]
+__all__ = ["FACTOR", "FIRST_DELAY", "MAX_ATTEMPTS", "MAX_DELAY", "next_delay"]
 
 FIRST_DELAY = timedelta(seconds=5)
 """What the first failure costs.
@@ -57,6 +78,19 @@ MAX_DELAY = timedelta(hours=1)
 Without one, doubling gets to days, and a destination that came back after
 twenty minutes would be left alone for a fortnight. The cap is what keeps a
 recovery detectable.
+"""
+
+MAX_ATTEMPTS = 5
+"""How many times a retryable failure is worth trying.
+
+Five, with the delays above, puts the last attempt about 75 seconds after the
+first, and then the reminder is *reported failed* rather than left pending. Any
+number would be defensible; what is not defensible is no number, because
+"pending" then has no end.
+
+This is the **default for new reminders**, not a rule the whole system reads. It
+is copied onto the row at creation -- see `Reminder.max_attempts` for why that
+distinction is the whole reason it is a column.
 """
 
 

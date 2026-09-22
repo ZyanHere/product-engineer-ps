@@ -3,7 +3,7 @@
 The break that motivated all of this, run against Stage 6's code:
 
     destination hit 30 times in one minute
-    row: done=False
+    row: not delivered
     what the database can say about why it has not arrived: nothing
 
 Two separate defects wearing one costume. The destination was being hit once
@@ -61,7 +61,7 @@ def test_a_refused_delivery_does_not_mark_the_reminder_done() -> None:
     [attempt] = reminders.tick(DUE_AT)
 
     assert attempt.delivered is False
-    assert store.load_all()[0].done is False
+    assert store.load_all()[0].state == "scheduled"
 
 
 def test_a_successful_delivery_still_marks_it_done() -> None:
@@ -74,7 +74,7 @@ def test_a_successful_delivery_still_marks_it_done() -> None:
     [attempt] = reminders.tick(DUE_AT)
 
     assert attempt.delivered is True
-    assert store.load_all()[0].done is True
+    assert store.load_all()[0].state == "delivered"
 
 
 def test_the_reminder_reaches_the_destination() -> None:
@@ -164,7 +164,7 @@ def test_the_failure_is_still_on_the_record_after_it_succeeds() -> None:
 
     assert [a.delivered for a in attempts] == [False, False, True]
     row = store.load_all()[0]
-    assert row.done is True
+    assert row.state == "delivered"
     assert row.last_error == "connection refused"
     assert row.next_attempt_at is None  # nothing is being waited out any more
 
@@ -212,7 +212,7 @@ def test_the_destination_stops_being_hammered() -> None:
     store = Store.open()
     destination = RefusingDestination()
     reminders = Reminders(store, destination)
-    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
+    reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=10_000)
 
     clock = FakeClock(DUE_AT)
     Runner(reminders, clock, poll_seconds=1.0).run_until(DUE_AT + timedelta(hours=1))
@@ -234,7 +234,7 @@ def test_the_backoff_survives_a_restart(tmp_path: Path) -> None:
 
     first = Store.open(path)
     reminders = Reminders(first, destination)
-    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
+    reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=10_000)
     Runner(reminders, FakeClock(DUE_AT), poll_seconds=1.0).run_until(DUE_AT + timedelta(seconds=40))
     first.close()
     # Four failures in: the gap is up to 40 seconds and the next try is at +75.
@@ -298,7 +298,7 @@ def test_the_original_due_time_is_never_rewritten() -> None:
     which is the one number anybody asks about afterwards."""
     store = Store.open()
     reminders = Reminders(store, RefusingDestination())
-    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
+    reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=10_000)
 
     Runner(reminders, FakeClock(DUE_AT), poll_seconds=1.0).run_until(DUE_AT + timedelta(minutes=10))
 

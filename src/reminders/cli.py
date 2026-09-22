@@ -26,6 +26,7 @@ only reason an outage is something you can *watch* rather than read about:
 
     python -m reminders --destination refusing
     python -m reminders --destination flaky:3
+    python -m reminders --destination invalid
 
 `list` shows the failure columns, so "why has this not arrived?" is answered by
 looking at the store rather than by trusting the scrollback.
@@ -42,6 +43,7 @@ from reminders.core import Delivery, Reminder, Reminders
 from reminders.delivery import (
     Destination,
     FlakyDestination,
+    InvalidRecipientDestination,
     PrintDestination,
     RefusingDestination,
 )
@@ -69,15 +71,30 @@ def _parse_instant(raw: str) -> datetime:
 
 def _format(reminder: Reminder) -> str:
     """Both halves: what was asked for, and where it landed."""
-    state = "done" if reminder.done else "waiting"
+    state = _state(reminder)
     asked = f"{reminder.local_datetime.isoformat()} {reminder.iana_zone}"
     note = "" if reminder.resolution_class == "exact" else f"  [{reminder.resolution_class}]"
     line = (
-        f"  {reminder.id}  {state:<7}  {reminder.due_at.isoformat()}"
+        f"  {reminder.id}  {state:<10}  {reminder.due_at.isoformat()}"
         f"   ({asked}){note}  {reminder.text}"
     )
     trouble = _trouble(reminder)
     return line if trouble is None else "\n".join((line, trouble))
+
+
+def _state(reminder: Reminder) -> str:
+    """What the user sees, and since Stage 8 there are three of them.
+
+    `failed` is the whole point. Until it existed, a reminder nobody could
+    deliver showed the same word as one that had not come due yet -- so the
+    honest summary of the system was "waiting", for three days, about something
+    that was never going to happen.
+    """
+    if reminder.state == "failed":
+        return "FAILED"
+    if reminder.state == "delivered":
+        return "delivered"
+    return "waiting"
 
 
 def _trouble(reminder: Reminder) -> str | None:
@@ -94,10 +111,14 @@ def _trouble(reminder: Reminder) -> str | None:
     if reminder.last_error is None:
         return None
     when = f" at {reminder.attempted_at.isoformat()}" if reminder.attempted_at else ""
-    waiting = (
-        f"; next try {reminder.next_attempt_at.isoformat()}" if reminder.next_attempt_at else ""
-    )
-    return f"       last error: {reminder.last_error}{when}{waiting}"
+    tries = f" [{reminder.attempt_count}/{reminder.max_attempts} attempts]"
+    if reminder.failure_reason is not None:
+        ending = f"; gave up: {reminder.failure_reason}"
+    elif reminder.next_attempt_at is not None:
+        ending = f"; next try {reminder.next_attempt_at.isoformat()}"
+    else:
+        ending = ""
+    return f"       last error: {reminder.last_error}{when}{tries}{ending}"
 
 
 def _report(deliveries: list[Delivery]) -> None:
@@ -109,8 +130,21 @@ def _report(deliveries: list[Delivery]) -> None:
     for delivery in deliveries:
         if delivery.delivered:
             continue  # the print destination announces its own successes
-        retry = f"  (retry {delivery.retry_at.isoformat()})" if delivery.retry_at else ""
-        print(f"FAIL {delivery.reminder.text}: {delivery.error}{retry}")
+        if delivery.failure_reason is not None:
+            note = f"  (GAVE UP: {delivery.failure_reason})"
+        elif delivery.retry_at is not None:
+            note = f"  (retry {delivery.retry_at.isoformat()})"
+        else:
+            note = ""
+        print(f"FAIL {delivery.reminder.text}: {delivery.error}{note}")
+
+
+def _tally(attempts: list[Delivery]) -> str:
+    """Three numbers, because since Stage 8 an attempt has three outcomes."""
+    delivered = sum(1 for a in attempts if a.delivered)
+    gave_up = sum(1 for a in attempts if a.failure_reason is not None)
+    refused = len(attempts) - delivered - gave_up
+    return f"{delivered} delivered, {refused} refused, {gave_up} gave up"
 
 
 def _adjustment_note(reminder: Reminder) -> str | None:
@@ -149,7 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--destination",
         default="print",
-        help="print | refusing | flaky:<n>  -- where reminders go, and whether it works",
+        help=(
+            "print | refusing | invalid | flaky:<n>  -- where reminders go, and how it goes wrong"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -173,16 +209,18 @@ def _destination(spec: str) -> Destination:
         return PrintDestination()
     if spec == "refusing":
         return RefusingDestination()
+    if spec == "invalid":
+        return InvalidRecipientDestination()
     if spec.startswith("flaky:"):
         return FlakyDestination(int(spec.removeprefix("flaky:")))
-    raise SystemExit(f"unknown destination: {spec!r} - try print, refusing, flaky:<n>")
+    raise SystemExit(f"unknown destination: {spec!r} - try print, refusing, invalid, flaky:<n>")
 
 
 def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
     print(
-        f"stage 7 - a refused delivery leaves a trace and backs off."
+        f"stage 8 - a reminder nobody can deliver stops pretending it is coming."
         f"  store: {where}  poll: {poll}s\n"
     )
     print(HELP)
@@ -232,8 +270,7 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                         clock.advance(at - clock.now())
                     attempts = reminders.tick(at)
                     _report(attempts)
-                    sent = sum(1 for a in attempts if a.delivered)
-                    print(f"  ({sent} delivered, {len(attempts) - sent} refused)")
+                    print(f"  ({_tally(attempts)})")
 
                 case "run":
                     if not rest:
@@ -241,11 +278,7 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                         continue
                     attempts = runner.run_until(_parse_instant(rest))
                     _report(attempts)
-                    sent = sum(1 for a in attempts if a.delivered)
-                    print(
-                        f"  ({sent} delivered, {len(attempts) - sent} refused, "
-                        f"clock now {clock.now().isoformat()})"
-                    )
+                    print(f"  ({_tally(attempts)}, clock now {clock.now().isoformat()})")
 
                 case "list":
                     items = reminders.all()

@@ -50,7 +50,7 @@ def test_a_reminder_survives_a_restart(tmp_path: Path) -> None:
         surviving = Reminders(second, SUCCEEDS).all()
         assert [r.text for r in surviving] == ["Call the clinic"]
         assert surviving[0].due_at == DUE_AT
-        assert surviving[0].done is False
+        assert surviving[0].state == "scheduled"
     finally:
         second.close()
 

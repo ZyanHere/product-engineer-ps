@@ -24,16 +24,24 @@ had nowhere to be written down. Two of them -- `last_error` and `attempted_at`
 built anyway rather than skipped ahead to: the smallest thing that answers
 *"why has this not arrived?"* is the most recent answer, and the reason a
 history is needed turns out to be a completely different failure.
+
+Stage 8 note
+------------
+`done` becomes `state`, because a boolean cannot hold three outcomes. The write
+that sets `failed` also spends the last of the budget, in one statement -- see
+`record_final_failure` for why that is not a stylistic preference.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import cast
 
-from reminders.core import Reminder
+from reminders.core import FailureReason, Reminder, State
+from reminders.retry import MAX_ATTEMPTS
 from reminders.timezones import ResolutionClass
 
 __all__ = ["Store"]
@@ -47,15 +55,19 @@ _REQUIRED_COLUMNS = {
     "due_at",
     "resolution_class",
     "text",
-    "done",
+    "state",
     "attempted_at",
     "last_error",
     "next_attempt_at",
+    "attempt_count",
+    "max_attempts",
+    "failure_reason",
 }
 
 _COLUMNS = (
-    "id, local_datetime, iana_zone, due_at, resolution_class, text, done, "
-    "attempted_at, last_error, next_attempt_at"
+    "id, local_datetime, iana_zone, due_at, resolution_class, text, state, "
+    "attempted_at, last_error, next_attempt_at, "
+    "attempt_count, max_attempts, failure_reason"
 )
 
 _SCHEMA = """
@@ -78,7 +90,12 @@ CREATE TABLE IF NOT EXISTS reminder (
     resolution_class TEXT  NOT NULL,
 
     text           TEXT    NOT NULL,
-    done           INTEGER NOT NULL,
+
+    -- Stage 8. Was `done INTEGER` until a reminder needed a third outcome:
+    -- scheduled, delivered, failed. A boolean made "nobody can ever deliver
+    -- this" hide inside "not yet", which is how an invalid recipient spent
+    -- three days looking like it was still coming.
+    state          TEXT    NOT NULL,
 
     -- Stage 7. All three NULL means "never tried", which is a different thing
     -- from "tried and it did not work" -- and one boolean could not tell them
@@ -86,7 +103,14 @@ CREATE TABLE IF NOT EXISTS reminder (
     -- had not come.
     attempted_at     TEXT,   -- when we last tried
     last_error       TEXT,   -- what it said when it refused
-    next_attempt_at  TEXT    -- not before this. The backoff, stored, not timed.
+    next_attempt_at  TEXT,   -- not before this. The backoff, stored, not timed.
+
+    -- Stage 8. The budget lives on the row, not in the code: a deploy that
+    -- lowered a shared constant would otherwise pass terminal judgement on
+    -- every reminder already part-way through its retries.
+    attempt_count    INTEGER NOT NULL,
+    max_attempts     INTEGER NOT NULL,
+    failure_reason   TEXT    -- set exactly when state = 'failed'
 )
 """
 
@@ -124,13 +148,23 @@ class Store:
     def close(self) -> None:
         self._connection.close()
 
+    def trace(self, callback: Callable[[str], object] | None) -> None:
+        """Watch the SQL this store actually runs, or stop watching.
+
+        Exists for one test: Stage 8 claims that spending the last attempt and
+        closing the reminder are a **single write**, and no behavioural test can
+        see between two commits. This can. Exposing the connection itself would
+        let anything reach past the store; this exposes only the observation.
+        """
+        self._connection.set_trace_callback(callback)
+
     def load_all(self) -> list[Reminder]:
         """Every reminder, in creation order."""
         rows = self._connection.execute(f"SELECT {_COLUMNS} FROM reminder ORDER BY id").fetchall()
         return [_to_reminder(row) for row in rows]
 
     def due(self, now: datetime) -> list[Reminder]:
-        """Reminders that are owed and have not been delivered yet.
+        """Reminders that are owed and still open.
 
         `due_at <= now`, never `== now`. A reminder is owed from its instant
         **onwards**, not only at the exact moment somebody happened to look.
@@ -149,12 +183,19 @@ class Store:
         on top of the due-check, restart recovery included, keeps working
         without being told retries exist.
 
+        `state = 'scheduled'` earns its place here at Stage 8 and not before. A
+        `done = 0` test said the same thing while there were two outcomes; now
+        there are three, and two of them are endings. A `failed` reminder is
+        excluded by the same clause that excludes a delivered one, which is what
+        makes "it is never picked up again" a property of the query rather than a
+        thing the caller has to remember.
+
         Comparison works because the timestamps are ISO-8601 text with a fixed
         shape, so SQLite's string ordering and chronological ordering agree.
         """
         rows = self._connection.execute(
             f"SELECT {_COLUMNS} FROM reminder "
-            "WHERE done = 0 AND COALESCE(next_attempt_at, due_at) <= ? "
+            "WHERE state = 'scheduled' AND COALESCE(next_attempt_at, due_at) <= ? "
             "ORDER BY due_at, id",
             (now.isoformat(),),
         ).fetchall()
@@ -167,6 +208,7 @@ class Store:
         due_at: datetime,
         resolution_class: ResolutionClass,
         text: str,
+        max_attempts: int = MAX_ATTEMPTS,
     ) -> Reminder:
         """Write a new reminder and return it, with the id the database gave it.
 
@@ -182,17 +224,23 @@ class Store:
         The three Stage 7 columns are left NULL rather than pre-filled. Nothing
         has been tried, and writing `next_attempt_at = due_at` here would make
         "never attempted" indistinguishable from "attempted, and due again now".
+
+        `max_attempts` is **copied in** rather than read at decision time, so a
+        later change to the default cannot pass judgement on reminders already
+        part-way through their retries.
         """
         cursor = self._connection.execute(
             "INSERT INTO reminder "
-            "(local_datetime, iana_zone, due_at, resolution_class, text, done) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
+            "(local_datetime, iana_zone, due_at, resolution_class, text, state, "
+            " attempt_count, max_attempts) "
+            "VALUES (?, ?, ?, ?, ?, 'scheduled', 0, ?)",
             (
                 local_datetime.isoformat(),
                 iana_zone,
                 due_at.isoformat(),
                 resolution_class,
                 text,
+                max_attempts,
             ),
         )
         self._connection.commit()
@@ -203,6 +251,7 @@ class Store:
             due_at=due_at,
             resolution_class=resolution_class,
             text=text,
+            max_attempts=max_attempts,
         )
 
     def mark_delivered(self, reminder_id: int, attempted_at: datetime) -> None:
@@ -216,9 +265,14 @@ class Store:
         `last_error` is deliberately **not** cleared. A reminder that took four
         tries should still say so; wiping the evidence on success is how an
         outage becomes invisible the moment it ends.
+
+        A success counts against `attempt_count` too. It is "how many times we
+        tried", not "how many times we failed" -- a delivery on the third try
+        should read as three attempts, because that is what the destination saw.
         """
         self._connection.execute(
-            "UPDATE reminder SET done = 1, attempted_at = ?, next_attempt_at = NULL WHERE id = ?",
+            "UPDATE reminder SET state = 'delivered', attempted_at = ?, "
+            "attempt_count = attempt_count + 1, next_attempt_at = NULL WHERE id = ?",
             (attempted_at.isoformat(), reminder_id),
         )
         self._connection.commit()
@@ -232,13 +286,16 @@ class Store:
     ) -> None:
         """Write down that a delivery was refused, and when to try again.
 
-        One statement, one commit, all three columns together. Splitting them
-        would allow a crash between "we tried" and "try again at", and a row
-        with an attempt but no next attempt is one this system would keep
-        retrying at full speed -- the exact behaviour being fixed.
+        For a failure with budget left. The reminder stays `scheduled`.
+
+        One statement, one commit, every column together. Splitting them would
+        allow a crash between "we tried" and "try again at", and a row with an
+        attempt but no next attempt is one this system would keep retrying at
+        full speed -- the exact behaviour being fixed.
         """
         self._connection.execute(
-            "UPDATE reminder SET attempted_at = ?, last_error = ?, next_attempt_at = ? "
+            "UPDATE reminder SET attempted_at = ?, last_error = ?, next_attempt_at = ?, "
+            "attempt_count = attempt_count + 1 "
             "WHERE id = ?",
             (
                 attempted_at.isoformat(),
@@ -249,9 +306,38 @@ class Store:
         )
         self._connection.commit()
 
+    def record_final_failure(
+        self,
+        reminder_id: int,
+        attempted_at: datetime,
+        error: str,
+        reason: FailureReason,
+    ) -> None:
+        """Close a reminder as `failed`, and spend the attempt, in one write.
+
+        This is the statement Stage 8 exists for, and the single write is not
+        tidiness. Split it into "spend the budget" and "set the state" and there
+        is an instant between the two commits where the row has no budget left
+        **and is still `scheduled`** -- so the next poll picks it up, finds
+        nothing left, and tries to close it again. A crash in that gap leaves the
+        reminder in exactly that shape permanently: polled forever, closed never.
+
+        `next_attempt_at` is cleared because a closed reminder has no next
+        attempt. Leaving it set would make a `failed` row look merely postponed
+        to anyone reading that column on its own.
+        """
+        self._connection.execute(
+            "UPDATE reminder SET state = 'failed', attempted_at = ?, last_error = ?, "
+            "failure_reason = ?, attempt_count = attempt_count + 1, "
+            "next_attempt_at = NULL "
+            "WHERE id = ?",
+            (attempted_at.isoformat(), error, reason, reminder_id),
+        )
+        self._connection.commit()
+
 
 def _to_reminder(row: tuple[object, ...]) -> Reminder:
-    """One database row as a Reminder. SQLite has no boolean; 0 and 1 is it."""
+    """One database row as a Reminder."""
     return Reminder(
         id=int(row[0]),  # type: ignore[call-overload]
         local_datetime=datetime.fromisoformat(str(row[1])),
@@ -259,10 +345,13 @@ def _to_reminder(row: tuple[object, ...]) -> Reminder:
         due_at=datetime.fromisoformat(str(row[3])),
         resolution_class=cast("ResolutionClass", str(row[4])),
         text=str(row[5]),
-        done=bool(row[6]),
+        state=cast("State", str(row[6])),
         attempted_at=_optional_instant(row[7]),
         last_error=None if row[8] is None else str(row[8]),
         next_attempt_at=_optional_instant(row[9]),
+        attempt_count=int(row[10]),  # type: ignore[call-overload]
+        max_attempts=int(row[11]),  # type: ignore[call-overload]
+        failure_reason=None if row[12] is None else cast("FailureReason", str(row[12])),
     )
 
 
