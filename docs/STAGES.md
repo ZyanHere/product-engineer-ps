@@ -1786,6 +1786,13 @@ Something other than a CLI needs to create these.
 
 # STAGE 16 — Something other than a CLI needs it
 
+> **Skipped.** Not built, and not pretended otherwise. Everything is driven from
+> the CLI; the service layer is already the seam an API would sit on, and nothing
+> in Stage 17 needed HTTP to be exercised. `SUBMISSION.md` says so under
+> *Limitations* rather than leaving a reviewer to notice.
+
+
+
 | | |
 | --- | --- |
 | **Capability at the end** | create, read, edit, cancel and inspect history over HTTP |
@@ -1836,6 +1843,10 @@ If most of the correctness testing happened here, the previous sixteen stages we
 
 ### Build
 
+- **17.0** *added while building:* **claiming and opening the attempt become one transaction** (`Store.claim_and_begin`)
+  - **17.0.1** they were two commits. A crash between them left a row `running` with no attempt record and **no budget spent** -- reclaimable, but a deterministic crash loop never ran out of road, because nothing was ever charged. Stage 10 bounded the retries and this gap quietly un-bounded them again, which is the same shape as Stage 9 routing around Stage 8
+  - **17.0.2** one commit now covers claim, sweep, exhaustion check, charge and attempt row. The earliest crash it can leave behind is *attempt exists, budget spent*, which every stage since 10 already handles
+  - **17.0.3** it absorbed `open_attempt` and `abandon` from the delivery path. Both survive as store operations the tests drive scenarios with; neither is called by `Reminders` any more
 - **17.1** the acceptance scenarios, end to end
 - **17.2** the benchmark: 20+ reminders, two zones, delivered / edited / cancelled / temporarily failing / permanently failing, a **real process kill** partway through, a forced duplicate, the clock advanced until everything settles
 - **17.3** the report: counts by final state, attempt outcomes, how many repeats the far side absorbed
@@ -1843,6 +1854,34 @@ If most of the correctness testing happened here, the previous sixteen stages we
 - **17.5** the honest assertion — count the sends that escaped before a cancel or an edit landed, and check the count is *exactly the ones we arranged*. Not zero. Zero is not achievable, and claiming it would be a lie the record can disprove
 - **17.6** re-run at a deliberately terrible claim duration and check the safety properties are unchanged
 - **17.7** `SUBMISSION.md` — the decisions, and the limits
+
+### What the benchmark actually reported
+
+```
+stage 17 - all of it at once  (claim 300.0s)
+
+  reminders                24
+  final state              cancelled=6, delivered=12, failed=6
+  attempt outcomes         delivered=18, refused=21, rejected=3, unknown=1
+  presentations            43
+  notifications            24
+  repeats absorbed         19
+  escaped before a cancel  3
+  escaped before an edit   3
+  keys delivered twice     0
+```
+
+Forty-three presentations, twenty-four notifications. The repeats come from retries, from an exhausted budget, and from the killed worker's takeover presenting a reminder the user may already have received. The single `unknown` is that worker's abandoned record, closed by its successor.
+
+The far side is a **file** rather than an object, because the killed worker is a real subprocess and "how many notifications did the user get?" has to be a question both processes can answer.
+
+### The one branch that is unreachable, said out loud
+
+`claim_and_begin` reconciles: if a successful attempt for the current version already exists, it commits the delivery instead of sending again. **No path through `Reminders` produces that state** — closing an attempt and settling its reminder are one transaction, so "succeeded but crashed before the terminal commit" is not something this codebase can leave behind. A crash there rolls back both halves and the record is swept to `unknown`, not `delivered`.
+
+Established by instrumenting the branch to raise and running the suite (**zero** tests reach it), then probing every way to construct the state through the public API. Only `close_attempt_only` gets there.
+
+It is kept, because the cost of being wrong is a duplicate notification — the most expensive failure this system has. But the test says so explicitly rather than leaving a reader to assume it fires, and the docstring no longer claims a cause that cannot occur.
 
 ### The sentence the submission has to contain
 

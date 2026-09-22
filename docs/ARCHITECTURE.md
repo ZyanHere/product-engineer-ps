@@ -1,6 +1,6 @@
 # Architecture and System Design — Durable Reminders and Follow-Ups
 
-**Problem:** [problems/03-durable-reminders/README.md](problems/03-durable-reminders/README.md)
+**Problem:** [problems/03-durable-reminders/README.md](../problems/03-durable-reminders/README.md)
 **Foundations:** [ANALYSIS.md](ANALYSIS.md) (why the problem is hard) · [CORRECTNESS_MODEL.md](CORRECTNESS_MODEL.md) (authoritative correctness model)
 
 This document takes the correctness model as given and asks one question: **what is the smallest system that mechanically enforces it?**

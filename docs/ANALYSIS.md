@@ -1,7 +1,7 @@
 # Problem Analysis — Durable Reminders and Follow-Ups
 
 **Status:** problem analysis. **Not** a design, not an implementation plan.
-**Source of truth:** [problems/03-durable-reminders/README.md](problems/03-durable-reminders/README.md)
+**Source of truth:** [problems/03-durable-reminders/README.md](../problems/03-durable-reminders/README.md)
 
 > ⚠ **PARTIALLY SUPERSEDED by [CORRECTNESS_MODEL.md](CORRECTNESS_MODEL.md).**
 > An adversarial pass found six invariants asserted here without an enforcing mechanism — most seriously **I-12**, which version-CAS alone does not enforce against a stale worker.

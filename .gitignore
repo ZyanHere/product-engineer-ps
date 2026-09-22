@@ -26,3 +26,12 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Scratch: demo databases and anything else a run leaves behind. Kept as a
+# folder rather than a pattern so `--db scratch/whatever.sqlite3` has an
+# obvious home and the repository root stays readable.
+scratch/*
+!scratch/README.md
