@@ -15,13 +15,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from reminders.core import Reminders
-from reminders.delivery import NullDestination
+from reminders.service import Reminders
 from reminders.store import Store
 from reminders.timezones import resolve
-
-# These stages are about *when* a reminder is owed, not where it goes.
-SUCCEEDS = NullDestination()
+from tests.shared import SUCCEEDS
 
 NY = "America/New_York"
 

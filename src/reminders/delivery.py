@@ -50,6 +50,23 @@ that forgets to classify something produces a retryable failure, which wastes
 requests and delays the bad news. The other default -- unknown means permanent
 -- would silently abandon deliverable reminders during an ordinary outage, and
 that is a much worse thing to get wrong by omission.
+
+Stage 9: why there are two truthful destinations here
+----------------------------------------------------
+`DeduplicatingDestination` behaves like a well-built far side: it remembers keys
+and treats a repeat as a repeat. `LedgerDestination` behaves like everything
+else: it records every presentation and collapses nothing.
+
+Both are needed, and the second one is the one that matters. Proving "we do not
+duplicate" against a destination that deduplicates proves **nothing** -- the
+double absorbs exactly the bug being looked for, and the test would still pass
+with the whole key mechanism deleted. Our half of the claim is narrower and
+checkable: *every presentation of one reminder carried the same key*, and that
+has to hold against something that merges nothing.
+
+`CrashAfterSendDestination` is the third: it puts the notification in the world
+and then kills the process. Shipped rather than confined to tests, because a
+crash you can only reproduce inside pytest is one nobody will look at.
 """
 
 from __future__ import annotations
@@ -57,18 +74,37 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from reminders.core import Reminder
+    from reminders.model import Reminder
 
 __all__ = [
+    "CrashAfterSendDestination",
+    "DeduplicatingDestination",
     "Destination",
     "DeliveryError",
     "FlakyDestination",
     "InvalidRecipientDestination",
+    "LedgerDestination",
     "NullDestination",
     "PermanentDeliveryError",
     "PrintDestination",
     "RefusingDestination",
+    "SimulatedCrash",
 ]
+
+
+class SimulatedCrash(BaseException):
+    """`kill -9`, as close as a single process can get to it.
+
+    A `BaseException` on purpose. A crash does not unwind, does not run
+    `finally`, and is not something any handler gets a say in -- so this must be
+    outside `Exception`, where no `except Exception` anywhere in the system can
+    accidentally turn the most important failure in the project into a caught
+    one.
+
+    What it cannot simulate: the write that was in the operating system's buffer
+    and never reached the disk. SQLite's own durability is taken as given here,
+    which is a real limit on these experiments and worth saying out loud.
+    """
 
 
 class DeliveryError(Exception):
@@ -164,6 +200,76 @@ class InvalidRecipientDestination:
     def send(self, reminder: Reminder) -> None:
         self.attempts += 1
         raise PermanentDeliveryError(self._reason)
+
+
+class LedgerDestination:
+    """Records every presentation and collapses nothing.
+
+    The honest baseline, and the only destination against which *our* half of
+    the idempotency claim can be checked: that every presentation of a reminder
+    carried the same key. A deduplicating destination would hide a bug here by
+    doing our job for us.
+    """
+
+    def __init__(self) -> None:
+        self.presentations: list[tuple[str, str]] = []
+        """(idempotency_key, text) for every send, in order. Duplicates included."""
+
+    def send(self, reminder: Reminder) -> None:
+        self.presentations.append((reminder.idempotency_key, reminder.text))
+
+    @property
+    def keys(self) -> list[str]:
+        return [key for key, _ in self.presentations]
+
+
+class DeduplicatingDestination:
+    """A far side that recognises a repeat, the way a good one does.
+
+    We cannot stop presenting the same reminder twice -- the crash in the middle
+    of a send makes that unavoidable. What a key buys is that the second
+    presentation does not *count*.
+
+    `notifications` is what a human would actually receive; `repeats` is what the
+    far side noticed and threw away.
+    """
+
+    def __init__(self) -> None:
+        self.notifications: list[str] = []
+        self.repeats: list[str] = []
+        self._seen: set[str] = set()
+
+    def send(self, reminder: Reminder) -> None:
+        if reminder.idempotency_key in self._seen:
+            self.repeats.append(reminder.text)
+            return  # accepted, and deliberately not delivered again
+        self._seen.add(reminder.idempotency_key)
+        self.notifications.append(reminder.text)
+
+
+class CrashAfterSendDestination:
+    """Delivers, then kills the process. The Stage 9 break, shipped.
+
+    The notification is appended to `notifications` *before* the crash, because
+    that is the whole difficulty: it is in the outside world and nothing we do
+    afterwards can take it back.
+
+    Wrap another destination to get the same crash against a far side that
+    deduplicates.
+    """
+
+    def __init__(self, inner: Destination, crash_on: set[int] | None = None) -> None:
+        self._inner = inner
+        self._crash_on = {1} if crash_on is None else crash_on
+        self.presentations = 0
+
+    def send(self, reminder: Reminder) -> None:
+        self.presentations += 1
+        self._inner.send(reminder)
+        if self.presentations in self._crash_on:
+            raise SimulatedCrash(
+                f"killed after presenting {reminder.text!r} (attempt {self.presentations})"
+            )
 
 
 class FlakyDestination:

@@ -30,6 +30,15 @@ only reason an outage is something you can *watch* rather than read about:
 
 `list` shows the failure columns, so "why has this not arrived?" is answered by
 looking at the store rather than by trusting the scrollback.
+
+Stage 9 adds the crash, and the history
+---------------------------------------
+    python -m reminders --db r.db --destination crash    # dies mid-send
+    python -m reminders --db r.db --destination dedupe   # then restart here
+
+`attempts <id>` prints the history, unfinished attempts included. That is the
+point of the whole stage: after a crash the database can say *a send may have
+happened*, which it previously could not.
 """
 
 from __future__ import annotations
@@ -39,15 +48,19 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from reminders.clock import Clock, FakeClock, SystemClock
-from reminders.core import Delivery, Reminder, Reminders
 from reminders.delivery import (
+    CrashAfterSendDestination,
+    DeduplicatingDestination,
     Destination,
     FlakyDestination,
     InvalidRecipientDestination,
+    LedgerDestination,
     PrintDestination,
     RefusingDestination,
 )
+from reminders.model import Attempt, Delivery, Reminder
 from reminders.runner import DEFAULT_POLL_SECONDS, Runner
+from reminders.service import Reminders
 from reminders.store import IN_MEMORY, Store
 
 __all__ = ["main"]
@@ -59,6 +72,7 @@ HELP = """commands:
   tick <utc-instant>            set the clock there, deliver anything owed
   run <utc-instant>             let the loop run until then
   list                          show everything
+  attempts <id>                 every attempt against one reminder
   help                          this
   quit                          exit
 """
@@ -69,7 +83,7 @@ def _parse_instant(raw: str) -> datetime:
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
-def _format(reminder: Reminder) -> str:
+def _format(reminder: Reminder, attempts: list[Attempt]) -> str:
     """Both halves: what was asked for, and where it landed."""
     state = _state(reminder)
     asked = f"{reminder.local_datetime.isoformat()} {reminder.iana_zone}"
@@ -78,7 +92,7 @@ def _format(reminder: Reminder) -> str:
         f"  {reminder.id}  {state:<10}  {reminder.due_at.isoformat()}"
         f"   ({asked}){note}  {reminder.text}"
     )
-    trouble = _trouble(reminder)
+    trouble = _trouble(reminder, attempts)
     return line if trouble is None else "\n".join((line, trouble))
 
 
@@ -97,28 +111,49 @@ def _state(reminder: Reminder) -> str:
     return "waiting"
 
 
-def _trouble(reminder: Reminder) -> str | None:
-    """The Stage 7 columns, read back out.
+def _trouble(reminder: Reminder, attempts: list[Attempt]) -> str | None:
+    """Why it has not arrived, read back out of the attempt history.
 
-    This is the whole stage in one function. Before it, the only honest answer
-    to "why has this not arrived?" was a shrug -- the row held one boolean and
-    a boolean cannot say *we tried and were refused*. The value is not that the
-    columns exist; it is that somebody who was not here can read them.
-
-    Kept on a failed reminder after it eventually succeeds, on purpose: an
-    outage that becomes invisible the moment it ends never gets fixed.
+    Since Stage 9 this comes from the `attempt` table rather than two columns on
+    the reminder, and the line it prints for an **unfinished** attempt is the
+    reason the table exists: an attempt with no ending means a send may have
+    happened and nobody here ever found out.
     """
-    if reminder.last_error is None:
+    if not attempts:
         return None
-    when = f" at {reminder.attempted_at.isoformat()}" if reminder.attempted_at else ""
-    tries = f" [{reminder.attempt_count}/{reminder.max_attempts} attempts]"
+
+    last = attempts[-1]
+    # "used", not "settled": since Stage 10 the budget is charged when an
+    # attempt opens, so a crash that reported nothing still shows up here.
+    tries = f"[{reminder.attempt_count}/{reminder.max_attempts} used]"
+
+    if last.unfinished:
+        return (
+            f"       !! attempt {last.id} started {last.started_at.isoformat()} and "
+            f"never finished - a send MAY have happened  {tries}"
+        )
+
+    if last.error is None:
+        return None  # delivered, nothing to explain
+
     if reminder.failure_reason is not None:
         ending = f"; gave up: {reminder.failure_reason}"
     elif reminder.next_attempt_at is not None:
         ending = f"; next try {reminder.next_attempt_at.isoformat()}"
     else:
         ending = ""
-    return f"       last error: {reminder.last_error}{when}{tries}{ending}"
+    return f"       last error: {last.error} at {last.started_at.isoformat()} {tries}{ending}"
+
+
+def _format_attempt(attempt: Attempt) -> str:
+    """One line of history. An unfinished attempt is shouted about."""
+    if attempt.unfinished:
+        return (
+            f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  "
+            "UNFINISHED - a send may have happened"
+        )
+    detail = f"  {attempt.error}" if attempt.error else ""
+    return f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  {attempt.outcome}{detail}"
 
 
 def _report(deliveries: list[Delivery]) -> None:
@@ -184,7 +219,8 @@ def main(argv: list[str] | None = None) -> int:
         "--destination",
         default="print",
         help=(
-            "print | refusing | invalid | flaky:<n>  -- where reminders go, and how it goes wrong"
+            "print | refusing | invalid | flaky:<n> | ledger | dedupe | crash"
+            "  -- where reminders go, and how it goes wrong"
         ),
     )
     args = parser.parse_args(argv)
@@ -211,17 +247,26 @@ def _destination(spec: str) -> Destination:
         return RefusingDestination()
     if spec == "invalid":
         return InvalidRecipientDestination()
+    if spec == "ledger":
+        return LedgerDestination()
+    if spec == "dedupe":
+        return DeduplicatingDestination()
+    if spec == "crash":
+        # Delivers for real, then kills the process. The Stage 9 break.
+        return CrashAfterSendDestination(PrintDestination())
     if spec.startswith("flaky:"):
         return FlakyDestination(int(spec.removeprefix("flaky:")))
-    raise SystemExit(f"unknown destination: {spec!r} - try print, refusing, invalid, flaky:<n>")
+    raise SystemExit(
+        f"unknown destination: {spec!r} - try print, refusing, invalid, "
+        "flaky:<n>, ledger, dedupe, crash"
+    )
 
 
 def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
     print(
-        f"stage 8 - a reminder nobody can deliver stops pretending it is coming."
-        f"  store: {where}  poll: {poll}s\n"
+        f"stage 9 - every send is written down before it happens.  store: {where}  poll: {poll}s\n"
     )
     print(HELP)
 
@@ -256,7 +301,7 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                         continue
                     when, zone, text = parts
                     created = reminders.create(datetime.fromisoformat(when), zone, text.strip())
-                    print(_format(created))
+                    print(_format(created, []))
                     note = _adjustment_note(created)
                     if note:
                         print(note)
@@ -285,7 +330,17 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                     if not items:
                         print("  nothing here")
                     for reminder in items:
-                        print(_format(reminder))
+                        print(_format(reminder, reminders.attempts(reminder.id)))
+
+                case "attempts":
+                    if not rest:
+                        print("  usage: attempts <reminder-id>")
+                        continue
+                    history = reminders.attempts(int(rest))
+                    if not history:
+                        print("  no attempts yet")
+                    for attempt in history:
+                        print(_format_attempt(attempt))
 
                 case _:
                     print(f"  unknown command: {command!r} - try 'help'")

@@ -55,11 +55,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from reminders.core import Delivery
+from reminders.model import Delivery
 
 if TYPE_CHECKING:
     from reminders.clock import Clock
-    from reminders.core import Reminders
+    from reminders.service import Reminders
 
 __all__ = ["DEFAULT_POLL_SECONDS", "Runner"]
 

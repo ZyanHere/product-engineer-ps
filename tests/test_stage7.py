@@ -13,35 +13,44 @@ had happened. Both come from the same root: one boolean, which cannot tell
 
 Nothing here waits for real time -- the fake clock's `sleep` is what moves
 time, so an hour of backoff costs a microsecond.
+
+Retrofitted at Stage 9
+----------------------
+The two columns these tests were written against -- `last_error` and
+`attempted_at` -- no longer exist. They were replaced by the `attempt` table,
+because one column cannot describe an attempt that never finished. Each test
+below now reads its evidence out of the history instead: the same question, asked
+of a better record.
+
+Retrofitted at Stage 8
+----------------------
+Three tests pass an enormous `max_attempts`. Stage 7 retried forever, so they
+never said how long they expected it to go on; Stage 8 gave the retry an ending,
+and without the override they would be measuring the *budget* instead of the
+*backoff*.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from reminders.clock import FakeClock
-from reminders.core import Reminder, Reminders
 from reminders.delivery import (
     DeliveryError,
     FlakyDestination,
     PrintDestination,
     RefusingDestination,
 )
+from reminders.model import Reminder
 from reminders.retry import FIRST_DELAY, MAX_DELAY, next_delay
 from reminders.runner import Runner
+from reminders.service import Reminders
 from reminders.store import Store
-
-START = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
-DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
-
-
-def naive(instant: datetime) -> datetime:
-    return instant.replace(tzinfo=None)
-
+from tests.shared import DUE_AT, naive
 
 # -- the destination can now refuse -----------------------------------------
 
@@ -92,9 +101,16 @@ def test_the_reminder_reaches_the_destination() -> None:
 def test_an_unexpected_exception_is_not_treated_as_a_refusal() -> None:
     """A `TypeError` in our own code is a bug, not an outage.
 
-    If it were caught as a delivery failure it would be written to
-    `last_error`, backed off, and retried for a week -- a crash converted into
-    a slow silent wrongness. It escapes instead.
+    If it were caught as a delivery failure it would be recorded as one, backed
+    off, and retried for a week -- a crash converted into a slow silent
+    wrongness. It escapes instead.
+
+    Since Stage 9 it leaves an **unfinished attempt** behind, which is right: from
+    inside the database a bug that escaped mid-send is indistinguishable from a
+    power cut mid-send, and both mean "a send may have happened".
+
+    And since Stage 10 it **costs an attempt**, for the same reason: a way of
+    failing that charges nothing is a way of retrying forever.
     """
 
     class Broken:
@@ -108,7 +124,9 @@ def test_an_unexpected_exception_is_not_treated_as_a_refusal() -> None:
     with pytest.raises(TypeError):
         reminders.tick(DUE_AT)
 
-    assert store.load_all()[0].last_error is None
+    [attempt] = store.attempts(1)
+    assert attempt.unfinished
+    assert store.load_all()[0].attempt_count == 1  # charged when it opened
 
 
 # -- the trace ---------------------------------------------------------------
@@ -127,24 +145,29 @@ def test_the_failure_and_its_time_are_recorded(tmp_path: Path) -> None:
 
     second = Store.open(path)
     try:
-        row = second.load_all()[0]
-        assert row.last_error == "host unreachable"
-        assert row.attempted_at == DUE_AT
-        assert row.next_attempt_at == DUE_AT + FIRST_DELAY
+        [attempt] = second.attempts(1)
+        assert attempt.error == "host unreachable"
+        assert attempt.outcome == "refused"
+        assert attempt.started_at == DUE_AT
+        assert second.load_all()[0].next_attempt_at == DUE_AT + FIRST_DELAY
     finally:
         second.close()
 
 
 def test_an_untried_reminder_says_so() -> None:
-    """The distinction the boolean could not make. All three columns NULL is
-    "never attempted", which is not the same as "attempted and refused" and
-    must not look like it."""
+    """The distinction the boolean could not make.
+
+    Stage 7 expressed "never attempted" as three NULL columns. Since Stage 9 it
+    is the plainer statement that there are no attempts -- an empty history
+    rather than a row full of nothing.
+    """
     store = Store.open()
     reminders = Reminders(store, RefusingDestination())
-    reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
+    created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
+    assert store.attempts(created.id) == []
     row = store.load_all()[0]
-    assert (row.attempted_at, row.last_error, row.next_attempt_at) == (None, None, None)
+    assert (row.attempt_count, row.next_attempt_at) == (0, None)
 
 
 def test_the_failure_is_still_on_the_record_after_it_succeeds() -> None:
@@ -165,8 +188,14 @@ def test_the_failure_is_still_on_the_record_after_it_succeeds() -> None:
     assert [a.delivered for a in attempts] == [False, False, True]
     row = store.load_all()[0]
     assert row.state == "delivered"
-    assert row.last_error == "connection refused"
     assert row.next_attempt_at is None  # nothing is being waited out any more
+
+    # The history is the part that must not be tidied away.
+    assert [a.outcome for a in store.attempts(row.id)] == [
+        "refused",
+        "refused",
+        "delivered",
+    ]
 
 
 # -- the backoff -------------------------------------------------------------
@@ -257,20 +286,26 @@ def test_the_backoff_survives_a_restart(tmp_path: Path) -> None:
 
 def test_the_gap_is_capped() -> None:
     """Uncapped doubling reaches days, and a destination that came back after
-    twenty minutes would be left alone for a fortnight."""
-    assert next_delay(MAX_DELAY) == MAX_DELAY
-    assert next_delay(MAX_DELAY / 2 + timedelta(seconds=1)) == MAX_DELAY
-    assert next_delay(timedelta(days=30)) == MAX_DELAY
+    twenty minutes would be left alone for a fortnight.
 
-
-def test_a_nonsense_previous_delay_does_not_stick_at_zero() -> None:
-    """Doubling zero is zero forever, which is the hammering again.
-
-    Nothing in this code writes that pair, but rows get edited by hand during
-    exactly the incident this mechanism exists for.
+    Since Stage 9 the input is a failure count, not the previous delay.
     """
-    assert next_delay(timedelta(0)) == FIRST_DELAY
-    assert next_delay(timedelta(seconds=-30)) == FIRST_DELAY
+    assert next_delay(0) == FIRST_DELAY
+    assert next_delay(1) == FIRST_DELAY * 2
+    assert next_delay(60) == MAX_DELAY
+    assert next_delay(10_000) == MAX_DELAY  # does not try to compute 2**10000
+
+
+def test_a_nonsense_failure_count_is_treated_as_the_first_failure() -> None:
+    """Nothing here writes a negative count, but the value comes from a column
+    and columns get edited by hand during exactly the incident this mechanism
+    exists for.
+
+    (Stage 7 needed a different guard here -- the delay was recovered by
+    subtracting two timestamps, and doubling a zero result stayed zero forever.
+    That failure mode cannot exist once the input is a count.)
+    """
+    assert next_delay(-1) == FIRST_DELAY
 
 
 # -- the scheduling model did not grow a second half ------------------------

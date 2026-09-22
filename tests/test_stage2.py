@@ -12,28 +12,12 @@ prove nothing.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
-from reminders.core import Reminders
-from reminders.delivery import NullDestination
+from reminders.service import Reminders
 from reminders.store import Store
-
-# These stages are about *when* a reminder is owed, not where it goes.
-SUCCEEDS = NullDestination()
-
-
-DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
-
-
-def naive(instant: datetime) -> datetime:
-    """The same wall time, with the offset stripped.
-
-    Since Stage 5, `create` takes what the user *said* plus a zone rather than
-    an instant somebody worked out. These tests are not about zones, so they
-    say it in UTC -- which resolves to exactly the instants they always used.
-    """
-    return instant.replace(tzinfo=None)
+from tests.shared import DUE_AT, SUCCEEDS, naive
 
 
 def test_a_reminder_survives_a_restart(tmp_path: Path) -> None:
@@ -122,7 +106,7 @@ def test_ids_do_not_restart_from_one(tmp_path: Path) -> None:
     """The database assigns ids, not a counter in memory.
 
     A counter would reset on restart and collide with everything already
-    stored -- two different reminders sharing an id, and `mark_done` closing
+    stored -- two different reminders sharing an id, and a settlement closing
     the wrong one.
     """
     db = tmp_path / "r.db"

@@ -20,13 +20,12 @@ Being wrong slowly is worse than being wrong quickly.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from reminders.clock import FakeClock
-from reminders.core import Delivery, Reminder, Reminders
 from reminders.delivery import (
     DeliveryError,
     Destination,
@@ -35,11 +34,12 @@ from reminders.delivery import (
     PermanentDeliveryError,
     RefusingDestination,
 )
+from reminders.model import Delivery, Reminder
 from reminders.retry import MAX_ATTEMPTS
 from reminders.runner import Runner
+from reminders.service import Reminders
 from reminders.store import Store
-
-DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
+from tests.shared import DUE_AT, naive
 
 LONG_ENOUGH = timedelta(minutes=10)
 """Long enough for the budget to be spent, and no longer.
@@ -50,10 +50,6 @@ seconds, and the remaining three days are 259,000 laps of a loop asking a
 question whose answer is already `[]`. The fake clock makes a long span
 *possible*, not free.
 """
-
-
-def naive(instant: datetime) -> datetime:
-    return instant.replace(tzinfo=None)
 
 
 def _run(store: Store, destination: Destination, until: timedelta = LONG_ENOUGH) -> list[Delivery]:
@@ -116,6 +112,17 @@ def test_the_last_attempt_and_the_closing_are_one_write() -> None:
 
     Checked by watching the statements SQLite actually executes. A behavioural
     test cannot see between two commits; this can.
+
+    *Retrofitted at Stage 9.* The requirement is unchanged; the mechanism is
+    not. Settling now touches two tables, so what used to be one `UPDATE` is two
+    inside one transaction -- and the property being asserted is the same one:
+    exactly one commit, so no reader ever sees half of it.
+
+    *Retrofitted at Stage 10.* The budget is no longer spent here at all -- it was
+    charged when the attempt opened -- so this now watches the **last** transaction
+    of the tick rather than the first, and checks that closing the attempt and
+    closing the reminder land together. The Stage 10 half of the same invariant is
+    in `test_stage10.py`.
     """
     store = Store.open()
     statements: list[str] = []
@@ -126,10 +133,21 @@ def test_the_last_attempt_and_the_closing_are_one_write() -> None:
     reminders.tick(DUE_AT)
     store.trace(None)
 
-    writes = [s for s in statements if "UPDATE" in s.upper()]
-    assert len(writes) == 1
-    assert "state = 'failed'" in writes[0]
-    assert "attempt_count = attempt_count + 1" in writes[0]
+    settling = statements[_last_index(statements, "BEGIN") :]
+    writes = [s for s in settling if s.startswith("UPDATE")]
+    assert len(writes) == 2
+    assert sum(1 for s in settling if s.upper().startswith("COMMIT")) == 1
+    assert any("state = 'failed'" in w for w in writes)
+    assert any("UPDATE attempt SET finished_at" in w for w in writes)
+
+
+def _last_index(statements: list[str], needle: str) -> int:
+    """Where the final transaction of the tick begins.
+
+    Since Stage 10 a tick opens two: one to charge and record the attempt, one to
+    settle it. This test is about the second.
+    """
+    return len(statements) - 1 - statements[::-1].index(needle)
 
 
 def test_the_failures_are_still_readable_after_it_gives_up() -> None:
@@ -138,9 +156,10 @@ def test_the_failures_are_still_readable_after_it_gives_up() -> None:
     _run(store, RefusingDestination("host unreachable"))
 
     row = store.load_all()[0]
-    assert row.last_error == "host unreachable"
-    assert row.attempted_at is not None
     assert row.next_attempt_at is None  # closed, not postponed
+    history = store.attempts(row.id)
+    assert len(history) == MAX_ATTEMPTS
+    assert all(a.error == "host unreachable" for a in history)
 
 
 # -- permanent failures ------------------------------------------------------
@@ -227,7 +246,8 @@ def test_an_unexpected_exception_is_still_not_a_delivery_failure() -> None:
 
     row = store.load_all()[0]
     assert row.state == "scheduled"
-    assert row.attempt_count == 0
+    assert row.attempt_count == 1  # Stage 10: the attempt opened, so it was charged
+    assert row.failure_reason is None  # but it was not recorded as a delivery failure
 
 
 # -- the ordinary path is untouched -----------------------------------------
@@ -244,7 +264,11 @@ def test_failures_then_a_success_still_delivers() -> None:
     assert row.state == "delivered"
     assert row.attempt_count == 3
     assert row.failure_reason is None
-    assert row.last_error == "connection refused"
+    assert [a.outcome for a in store.attempts(row.id)] == [
+        "refused",
+        "refused",
+        "delivered",
+    ]
 
 
 def test_a_success_on_the_last_attempt_still_counts_as_a_success() -> None:

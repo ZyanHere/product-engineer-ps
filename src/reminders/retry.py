@@ -16,10 +16,16 @@ system forgets it was backing off, comes back up, and hammers again -- and a
 restart during an outage is not a coincidence, it is the normal response to
 one.
 
-Hence the signature. This function takes the *previous* delay, and the previous
-delay is `next_attempt_at - attempted_at`: two columns, both on the row. Nothing
-here can consult a counter that does not survive a restart, because there is
-nowhere to put one.
+Hence the signature: this function is handed a number that came out of the
+database, and there is nowhere in it to keep one that did not.
+
+*Rewritten at Stage 9.* It used to take the **previous delay**, recovered by
+subtracting two timestamp columns on the reminder. That was a workaround for not
+having the thing it actually wanted -- *how many times has this failed* -- and it
+needed a guard against the subtraction producing zero, because doubling zero
+stays zero forever. Stage 8 introduced a real count and Stage 9 deleted the
+timestamps into the attempt table, so the workaround lost both its input and its
+reason to exist.
 
 Stage 8 adds the other half
 ---------------------------
@@ -94,22 +100,34 @@ distinction is the whole reason it is a column.
 """
 
 
-def next_delay(previous: timedelta | None) -> timedelta:
-    """How long to wait after a failure, given the wait before it.
+def next_delay(failures_so_far: int) -> timedelta:
+    """How long to wait after a failure, given how many came before it.
 
     Args:
-        previous: the gap the last failure imposed, or `None` if this is the
-            first failure for this reminder.
+        failures_so_far: attempts already settled against this reminder, **not**
+            counting the one that just failed. Zero on the first failure.
 
     Returns:
-        The next gap: `FIRST_DELAY`, then doubling, then flat at `MAX_DELAY`.
+        `FIRST_DELAY`, then doubling, then flat at `MAX_DELAY`.
 
-    A `previous` that is zero or negative is treated as a first failure. It
-    means the stored pair says a retry was due at or before the moment it was
-    scheduled, which is not a state this writes -- but rows can be edited by
-    hand, and doubling zero stays zero forever, which is the hammering this
-    function exists to stop.
+    A negative count is treated as the first failure. Nothing here writes one,
+    but the value comes from a column and columns get edited by hand during
+    exactly the incident this mechanism exists for.
     """
-    if previous is None or previous <= timedelta(0):
-        return FIRST_DELAY
-    return min(previous * FACTOR, MAX_DELAY)
+    doublings = min(max(failures_so_far, 0), _DOUBLINGS_PAST_MAX)
+    grown: timedelta = FIRST_DELAY * FACTOR**doublings
+    return min(grown, MAX_DELAY)
+
+
+_DOUBLINGS_PAST_MAX = (MAX_DELAY // FIRST_DELAY).bit_length()
+"""Where doubling has certainly overshot the cap, so there is nothing to compute.
+
+Not a tuning knob -- a guard, and derived from the two constants above rather
+than picked, so it cannot drift out of step with them.
+
+It is needed because `failures_so_far` comes from a column. A row that somehow
+holds a large count would otherwise ask Python for `2 ** 4000` seconds, which
+overflows when it reaches C -- turning a silly number in the database into a
+crashed poll for every reminder behind it. (Found by a test asking for
+`next_delay(60)`, which was well inside the hand-picked guard this replaced.)
+"""

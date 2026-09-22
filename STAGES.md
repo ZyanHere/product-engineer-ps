@@ -828,9 +828,22 @@ start it again
 
 ### What happens
 
+*Measured.* `kill -9` mid-send, then a restart on the same file:
+
+```
+process 1: killed mid-send
+  the notification is on their phone: ['Call the clinic']
+  what our database says:  state=scheduled  attempts=0
+
+process 2: restarted. It has to decide what to do with that row.
+  state=delivered  attempts=1
+
+what is on their phone now: ['Call the clinic', 'Call the clinic']
+```
+
 Two problems from one experiment, and they are genuinely separate.
 
-**One:** the row says not-done. Did the notification go out or not? Look anywhere you like — there is no answer. The last thing we wrote was "not done yet", and the process died between the send and the write.
+**One:** did the notification go out or not? Look anywhere you like — there is no answer. And it is worse than the plan predicted: `attempts=0`. The crash left **no trace whatsoever**, so process 2 could not have known there was anything to be careful about.
 
 **Two:** because we do not know, we retry. **The user gets it twice.**
 
@@ -887,6 +900,11 @@ That last answer is correct today and gets revisited at Stage 14, when the user 
 - **9.5** and separately, a destination that recognises **nothing**
   - **9.5.1** *why both:* proving "we do not duplicate" against a destination that deduplicates proves nothing — the double absorbs exactly the bugs we are looking for. Our half of the claim is *"every presentation carried the same key"*, and that must hold against something that collapses nothing
 - **9.6** **no transaction is open across the send.** Commit, send, commit. This is a rule the shape of the code has to enforce, because no predicate can
+  - **9.6.1** *as built:* Stage 8 got its atomicity from a single `UPDATE`. Settling now touches two tables, so the same guarantee has to come from a single **transaction** — with an explicit `BEGIN`, because leaving the most important write in the project relying on sqlite3's implicit-transaction default is not a guarantee
+- **9.7** *added while building:* `PRAGMA foreign_keys = ON`
+  - **9.7.1** the `REFERENCES` clause on its own is a comment. SQLite honours it only with the pragma, and the pragma is off by default **per connection** — demonstrated: with it off, an attempt naming reminder 999 is accepted silently, and the history it belongs to can never be found again
+- **9.8** *rework not in the plan:* the backoff is rewritten to take a **failure count** instead of the previous delay
+  - **9.8.1** Stage 7 recovered the delay by subtracting `next_attempt_at - attempted_at`, which was a workaround for not having a count, and needed a guard because doubling a zero result stays zero forever. Stage 8 introduced a real count and this stage deletes the timestamps into `attempt`, so the workaround lost both its input and its reason to exist
 
 ### Persistence
 
@@ -907,9 +925,121 @@ That last answer is correct today and gets revisited at Stage 14, when the user 
 
 Something we have not looked at: the budget from Stage 8 is counted somewhere, and we just added a way to die without reaching that somewhere.
 
+Three more, named rather than fixed:
+
+- **Nothing ever closes an open attempt.** The restart opens a *second* attempt and leaves the first as it found it — deliberately, because from inside the database "abandoned" and "still in flight" are the same row, and closing it would be a guess written down as a fact. Stage 12 is where something can tell them apart.
+- **An unexpected exception now leaves an open attempt too.** Correct, and worth noticing: a bug that escaped mid-send is indistinguishable from a power cut mid-send, and both mean *a send may have happened*.
+- **`SimulatedCrash` cannot simulate a lost write.** It stops the process; it does not stop a write already in the operating system's buffer from failing to reach the disk. SQLite's own durability is assumed here, which is a real limit on these experiments.
+
+### Rework this stage caused
+
+Nine tests across Stages 7 and 8 broke, all of them on `last_error` / `attempted_at`, which no longer exist. Each now reads its evidence out of the attempt history — the same question asked of a better record. The Stage 8 single-write test kept its assertion and changed its mechanism: one `UPDATE` became two inside one transaction, and the property checked is still *exactly one commit*.
+
+One test needed more than retrofitting. `test_ordering_is_stable...` asserted that attempts created in one instant read back in order — and a mutation to `ORDER BY started_at` **did not fail it**, because with identical timestamps SQLite happens to return rowid order anyway. It was passing by luck. The replacement uses timestamps that go *backwards*, which is not contrived: `SystemClock` reads a wall clock, wall clocks get corrected, and an NTP step between two attempts puts the later one earlier. Ordering a history by a value the outside world can move reports the sequence of events wrongly at exactly the moment somebody is reading it to work out what happened.
+
+And one guard was wrong the moment it was written: `next_delay` had a hand-picked ceiling of 64 doublings, which a test asking for `next_delay(60)` walked straight past into `2 ** 60` seconds and an `OverflowError` from C. It is now derived from the two delay constants — `(MAX_DELAY // FIRST_DELAY).bit_length()`, which is 10 — so it cannot drift out of step with them.
+
 ### Next question
 
 **Do the same crash three times in a row.**
+
+---
+
+# INTERLUDE after Stage 9 — the files, not the behaviour
+
+Not a stage. Nothing here changes what the system does, and the whole suite was
+green before and after. It is recorded because "when do you stop adding to a file
+and split it" is a real decision and this is where the answer stopped being *not
+yet*.
+
+### What prompted it
+
+A measurement, not a feeling. After Stage 9:
+
+| | |
+| --- | --- |
+| `store.py` | 286 lines of code, **17 methods, two tables**, two schemas, two column lists, two row mappings |
+| `core.py` | the data types **and** the service that operates on them |
+| tests | **seven** copies of `DUE_AT`, seven of `naive()`, no shared module at all |
+
+The middle one had a symptom worth naming: `store.py` imported types from
+`core.py` while `core.py` imported `Store` back under a `TYPE_CHECKING` guard.
+That cycle worked, and it worked because a guard was hiding it.
+
+### What changed
+
+```
+   core.py        ->   model.py      the data. Depends on nothing but stdlib
+                       service.py    the one place that decides anything
+
+   store.py       ->   store/reminders.py   statements against `reminder`
+                       store/attempts.py    statements against `attempt`
+                       store/__init__.py    the connection, the schema, the commits
+
+   (nothing)      ->   tests/shared.py      two instants, one helper, one destination
+```
+
+The import cycle is now a line: `model <- store <- service`, with no
+`TYPE_CHECKING` guard holding it together.
+
+### The seam that matters
+
+The store did **not** split along "one file per table" for tidiness. It split
+along the **transaction boundary**, and the rule that fell out is the useful
+part:
+
+> The table modules issue statements and **never commit**. The `Store` owns the
+> connection and every commit.
+
+That rule exists because of Stage 8 and Stage 9 together. Settling a delivery has
+to close an attempt *and* move the reminder with no instant in between where a
+reader sees one and not the other. Stage 8 got that from a single `UPDATE`; two
+tables means it has to come from a single transaction — and a transaction is not
+something either table can own on its own. Putting the commits in one place makes
+that structural rather than remembered.
+
+### Why not earlier, and why not later
+
+Earlier would have been guessing. At Stage 2 the store was one table and thirty
+lines; splitting it would have been a prediction about a shape that had not
+appeared yet, which is rule 1 in this document violated with better intentions.
+
+Later would have cost more. Stage 10 reworks *when the budget is spent*, which
+touches both the reminder writes and the attempt writes — doing the split
+afterwards means doing that merge twice.
+
+### `tests/shared.py`, and why it is not a `conftest.py`
+
+A conftest exists for fixtures and for pytest to find without being asked.
+Nothing extracted here is a fixture: `DUE_AT` as a fixture would be an instant you
+have to go and look up, written in a way that suggests it is doing something.
+
+It is also deliberately thin — two instants, one three-line helper, one
+destination. Shared setup is the easiest place in a test suite to hide something,
+and setup a reader cannot see is how a test ends up asserting what nobody
+intended. **Each stage keeps its own wiring visible in its own file**, because in
+this project the wiring is frequently the thing under test: which store, which
+destination, which clock, and in what order they were opened.
+
+### What was left alone, and why
+
+- **`cli.py` is the largest file now, at 225 lines of code**, most of it in one
+  `_prompt` loop of 59 statements. It is a `match` over commands: flat, boring,
+  and read top to bottom. Splitting it would trade something obvious for
+  something indirected. It gets revisited at Stage 16, when an HTTP API needs the
+  same commands and the duplication becomes real.
+- **The failing destinations still ship in `delivery.py`.** `refusing`,
+  `invalid`, `crash` and `flaky` are wired into the CLI on purpose: an outage you
+  can only reproduce inside pytest is one nobody looks at. `NullDestination` is
+  the exception — it exists only so Stage 1 to 6 tests do not print — and that is
+  a fair criticism, not a defence.
+- **`Store.trace()` is a test seam in the production API.** Two of this
+  project's claims are about the *shape* of the writes rather than their effect,
+  and no behavioural test can see between two commits. Named as a cost rather
+  than justified away.
+- **The prose ratio.** 878 lines of executable code carry roughly 1,400 of
+  explanation. That is deliberate for an assessment, where the reasoning is the
+  deliverable. On a team most of it would be commit messages and ADRs instead.
 
 ---
 
@@ -932,9 +1062,18 @@ restart.  kill again.  restart.  kill again.
 
 ### What happens
 
+*Measured.* Budget of 3, killed mid-send ten times, each restart a fresh store on the same file:
+
+```
+after crash  1: state=scheduled attempt_count=0/3  attempt rows=1  presented=1
+after crash  2: state=scheduled attempt_count=0/3  attempt rows=2  presented=2
+after crash  3: state=scheduled attempt_count=0/3  attempt rows=3  presented=3
+after crash 10: state=scheduled attempt_count=0/3  attempt rows=10  presented=10
+```
+
 It is still going. Ten crashes later, it is still going.
 
-Check the attempt count: **zero.** The budget from Stage 8 has not moved once, while the destination has been presented with the same reminder ten times.
+Check the attempt count: **zero.** The budget from Stage 8 has not moved once, while the destination has been presented with the same reminder ten times — and the tell is in the same line, because Stage 9's table gives it away: **ten attempt rows against a count of nought.** Two numbers that describe the same thing, disagreeing by ten.
 
 ### Why
 
@@ -963,10 +1102,24 @@ Paying for a send that did not happen costs one wasted retry. Not paying for a s
 - **10.1** spend the budget in the same write that opens the attempt record
 - **10.2** remove the spend from the close path entirely — one place, not two
 - **10.3** the number of attempt records and the count must agree; nothing else may move either
+- **10.4** *added while building:* the budget is checked **before** the attempt is opened, as well as after the send
+  - **10.4.1** charging at the open creates a row shape Stage 8's invariant had ruled out: `scheduled` with the budget already gone. The write that used to spend the last attempt also closed the reminder; a crash spends it and never reaches that write. So the loop now meets a reminder it must neither send nor leave
+  - **10.4.2** `Store.abandon` closes it with **no attempt row and no charge**, because nothing was attempted. Without it the loop would have to open an attempt just to have something to close — presenting the reminder once more than its budget allows, and charging for the privilege
 
 ### Persistence
 
 No new columns. The same counter, moved.
+
+### After
+
+```
+after crash  1: state=scheduled attempt_count=1/3  attempt rows=1  presented=1
+after crash  2: state=scheduled attempt_count=2/3  attempt rows=2  presented=2
+after crash  3: state=scheduled attempt_count=3/3  attempt rows=3  presented=3
+after crash 10: state=failed    attempt_count=3/3  attempt rows=3  presented=3
+```
+
+Ten presentations became three — the budget, exactly. The fourth poll finds a reminder with nothing left, sends nothing, and closes it.
 
 ### Tests
 
@@ -978,6 +1131,24 @@ No new columns. The same counter, moved.
 ### Still broken
 
 All of this still assumes **one** process doing the work.
+
+And one honest limit on the claim in the title. A destination that crashes on
+*every* send never terminates, and no budget can fix that: closing a reminder
+requires a write, and the process dies before every write. What the charge buys is
+narrower and still worth having — **the moment one attempt completes, the
+accounting is already correct**, so it stops immediately instead of starting over.
+
+### Rework this stage caused
+
+Four tests. Two asserted `attempt_count == 0` after an unexpected exception, which
+is now 1 and is the point of the stage: a way of failing that charges nothing is a
+way of retrying forever. Two watched the SQL and looked for the *first* `BEGIN` of
+a tick; a tick now opens two transactions, so they look for the last.
+
+`attempts_left(after_this_one=True)` became `attempts_left(charged_since=1)`. The
+old boolean asked "count the one about to be made", which stopped being the right
+question once the row was charged before the send. The new name says what it
+means: attempts charged since this snapshot was taken.
 
 ### Next question
 

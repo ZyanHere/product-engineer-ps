@@ -12,13 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from reminders.core import Reminders
-from reminders.delivery import NullDestination
+from reminders.service import Reminders
 from reminders.store import Store
 from reminders.timezones import UnknownTimeZoneError, resolve
-
-# These stages are about *when* a reminder is owed, not where it goes.
-SUCCEEDS = NullDestination()
+from tests.shared import SUCCEEDS
 
 NINE_AM = datetime(2026, 3, 9, 9, 0)  # naive: what somebody actually said
 
