@@ -45,13 +45,7 @@ from reminders.delivery import (
 from reminders.model import Reminder
 from reminders.service import Reminders
 from reminders.store import Store
-from tests.shared import DUE_AT, naive
-
-# A reminder nobody has claimed has `claim_seq = 0`, and Stage 13 requires every
-# worker write to carry the current one. Tests that drive the store directly,
-# without a claim, pass 0 for it. A real worker can never hold 0: `claim()` bumps
-# the counter before handing it back, so the first token it can ever return is 1.
-UNCLAIMED = 0
+from tests.shared import DUE_AT, hold, naive
 
 SHORT = timedelta(seconds=30)
 
@@ -263,7 +257,8 @@ def test_a_takeover_does_not_touch_another_reminders_history(tmp_path: Path) -> 
     store = Store.open(path)
     try:
         other = Reminders(store, LedgerDestination()).create(naive(DUE_AT), "UTC", "other")
-        in_flight = store.open_attempt(other.id, DUE_AT, UNCLAIMED)  # somebody is working on it
+        # Somebody really is working on it: a live claim, not a hand-made one.
+        in_flight = store.open_attempt(other.id, DUE_AT, hold(store, other.id))
 
         after = DUE_AT + SHORT
         store.claim(abandoned.id, after, after + SHORT, "the-live-one")

@@ -69,7 +69,16 @@ from typing import TYPE_CHECKING
 
 from reminders.claims import CLAIM_DURATION, new_worker_id
 from reminders.delivery import DeliveryError, PermanentDeliveryError
-from reminders.model import Attempt, AttemptOutcome, Delivery, FailureReason, Reminder
+from reminders.model import (
+    Attempt,
+    AttemptOutcome,
+    CannotCancelError,
+    Claim,
+    Delivery,
+    FailureReason,
+    Reminder,
+    StaleVersionError,
+)
 from reminders.retry import MAX_ATTEMPTS, next_delay
 from reminders.timezones import resolve
 
@@ -148,6 +157,141 @@ class Reminders:
             max_attempts,
         )
 
+    def edit(
+        self,
+        reminder_id: int,
+        base_version: int,
+        local_datetime: datetime,
+        iana_zone: str,
+        text: str,
+    ) -> Reminder:
+        """Change a reminder, safely, even while a worker is sending it.
+
+        `base_version` is **required**, not optional, and that is the one design
+        decision here worth arguing about. An optional "if you know it" parameter
+        is one caller away from reintroducing the silent overwrite for everybody:
+        two people open the same reminder, both save, and the first is thanked for
+        a change that no longer exists. Making it mandatory means the question
+        *"what were you looking at?"* has to be answered by every caller that
+        exists and every caller that will.
+
+        A stale base raises `StaleVersionError` **carrying the current version**,
+        so the caller can re-read and retry. A refusal that does not say what it
+        lost to is one nobody can act on.
+
+        What this does to a worker already sending: nothing, directly. It moves
+        the version, and the worker's next write no longer matches. It is not
+        notified, for the same reason a replaced worker is not -- it finds out by
+        writing and being told nothing changed.
+
+        What it deliberately does not do is rewrite the row the worker resolved
+        from. The old version's time, text and key stay exactly where they were,
+        in a table nothing updates, so the history can still say what was sent.
+
+        **A terminal reminder can be edited too**, and that is worth spelling out
+        because the first version of this method refused it -- a rule invented
+        without a failure behind it, which the first real scenario then
+        contradicted. *"The meeting moved, send a correction"* is an ordinary
+        thing to want, and so is *"fix the recipient on the one that failed"*.
+
+        What makes both safe is the versioning itself, which is the whole payoff:
+        the existing delivery record belongs to version 1 and stays exactly where
+        it is, the correction is version 2 with its own key, and the history shows
+        both. Refusing the edit would have thrown that away and left the user to
+        create a second reminder that the record cannot connect to the first.
+
+        **Cancelled is the exception**, and it is the state Stage 14 said it would
+        not guess at. `delivered` and `failed` are endings the *system* arrived
+        at, and correcting them is an ordinary thing to want. `cancelled` is an
+        ending the **user** chose, and editing it would quietly resurrect exactly
+        what they stopped. Reviving it has to be an explicit act, not a
+        side-effect of changing the wording.
+        """
+        current = self._store.get(reminder_id)
+        if current is None:
+            raise LookupError(f"no reminder {reminder_id}")
+        if current.state == "cancelled":
+            raise ValueError(f"reminder {reminder_id} was cancelled and cannot be edited")
+
+        resolved = resolve(local_datetime, iana_zone)
+        revised = self._store.revise(
+            reminder_id,
+            base_version,
+            local_datetime,
+            iana_zone,
+            resolved.instant,
+            resolved.classification,
+            text,
+        )
+        if not revised:
+            raise StaleVersionError(current.version)
+
+        after = self._store.get(reminder_id)
+        assert after is not None  # we just wrote it
+        return after
+
+    def cancel(self, reminder_id: int) -> Reminder:
+        """Stop a reminder before it commits. Stage 15.
+
+        **No version parameter**, unlike `edit`, and the asymmetry is deliberate.
+        An edit is a revision of a specific earlier state, so it has to say which
+        one. A cancellation is version-free: *"I do not want this, whatever it
+        currently says."* Demanding a version would refuse a legitimate
+        cancellation because somebody else edited first -- the worst possible
+        failure for the one operation whose whole job is to stop a notification.
+
+        **Cancelling an already-cancelled reminder succeeds quietly.** A client
+        retrying after a network failure must not be told it failed when its
+        intent is already satisfied.
+
+        **Cancelling one that has already ended some other way is refused**, and
+        says which ending it hit. Reporting success there would be the worst
+        possible silence: somebody who cancelled because it must not go out
+        deserves to know that it already did.
+
+        What this does *not* promise, stated precisely because it is easy to
+        over-claim: if the send has already left, the notification exists, and no
+        condition in a database reaches into the world and takes it back. The
+        guarantee is **not** "cancelling stops the message". It is "cancelling
+        stops the message from being recorded as a delivery" -- and the attempt
+        history still says a send went out, which is information rather than a
+        contradiction.
+        """
+        if self._store.cancel(reminder_id):
+            after = self._store.get(reminder_id)
+            assert after is not None  # we just wrote it
+            return after
+
+        current = self._store.get(reminder_id)
+        if current is None:
+            raise LookupError(f"no reminder {reminder_id}")
+        if current.state == "cancelled":
+            return current  # already what the caller wanted
+        raise CannotCancelError(current.state)
+
+    def sweep(self, now: datetime) -> int:
+        """Close attempt records nothing will ever reach. Stage 15.
+
+        Housekeeping, not delivery, which is why it is its own method and why the
+        `Runner` calls it once per poll rather than `tick` doing it quietly. The
+        two answer different questions and fail in different ways.
+
+        The grace period is `claim_for` -- exactly as long as a takeover would
+        have waited. Not a new judgement: the same one, for the same reason.
+        Sweeping sooner would take the record away from a worker that was about to
+        report the truth about it.
+        """
+        return self._store.sweep_attempts(now, self._claim_for)
+
+    def versions(self, reminder_id: int) -> list[tuple[int, datetime, str, str]]:
+        """Every version of one reminder: (version, due_at, text, key).
+
+        Reading the superseded ones is the point of keeping them: *what was
+        actually sent, and for which intent?* has an answer long after the user
+        has moved on.
+        """
+        return self._store.versions(reminder_id)
+
     def tick(self, now: datetime) -> list[Delivery]:
         """Deliver everything owed at `now`, and record how each one went.
 
@@ -189,6 +333,16 @@ class Reminders:
         account of it is the only one, and a second opinion from a worker that no
         longer owns the job is exactly the damage being prevented.
 
+        **Stage 14 adds the second number.** The token answers *was I replaced?*
+        and the version answers *is this still what the user wants?* -- and those
+        move on different events, so a worker can be perfectly current about one
+        and completely out of date about the other. A user editing mid-send
+        replaces nobody, so the token still matches and the write sails through;
+        that is how a reminder got recorded as delivered carrying text the user
+        had already replaced. Both travel together in `Claim` for exactly that
+        reason: carrying them as one value is what stops a future write path
+        remembering one and forgetting the other.
+
         Then three steps per reminder, and the order is the whole of Stage 9:
 
             commit    open an attempt, with no outcome
@@ -227,15 +381,15 @@ class Reminders:
         deliveries: list[Delivery] = []
 
         for reminder in self._store.due(now):
-            fence = self._store.claim(reminder.id, now, now + self._claim_for, self._worker)
-            if fence is None:
+            claim = self._store.claim(reminder.id, now, now + self._claim_for, self._worker)
+            if claim is None:
                 continue  # somebody else has it. Nothing to do, nothing to undo.
 
             if reminder.attempts_left() == 0:
                 # Charged for attempts that never reported back. Nothing left to
                 # spend, so nothing is sent and nothing is charged -- it is simply
                 # closed, and says why.
-                if self._store.abandon(reminder.id, "retries_exhausted", fence):
+                if self._store.abandon(reminder.id, "retries_exhausted", claim):
                     deliveries.append(
                         Delivery(
                             reminder,
@@ -245,27 +399,27 @@ class Reminders:
                     )
                 continue
 
-            attempt_id = self._store.open_attempt(reminder.id, now, fence)
+            attempt_id = self._store.open_attempt(reminder.id, now, claim)
             if attempt_id is None:
                 continue  # replaced between claiming and recording it
 
             try:
                 self._destination.send(reminder)
             except PermanentDeliveryError as exc:
-                landed = self._give_up(attempt_id, reminder, now, exc, "rejected", fence)
+                landed = self._give_up(attempt_id, reminder, now, exc, "rejected", claim)
                 if landed is not None:
                     deliveries.append(landed)
             except DeliveryError as exc:
                 if reminder.attempts_left(charged_since=1) > 0:
-                    deferred = self._defer(attempt_id, reminder, now, exc, fence)
+                    deferred = self._defer(attempt_id, reminder, now, exc, claim)
                     if deferred is not None:
                         deliveries.append(deferred)
                 else:
-                    landed = self._give_up(attempt_id, reminder, now, exc, "refused", fence)
+                    landed = self._give_up(attempt_id, reminder, now, exc, "refused", claim)
                     if landed is not None:
                         deliveries.append(landed)
             else:
-                if self._store.settle_delivered(attempt_id, reminder.id, now, fence):
+                if self._store.settle_delivered(attempt_id, reminder.id, now, claim):
                     deliveries.append(Delivery(reminder))
 
         return deliveries
@@ -276,7 +430,7 @@ class Reminders:
         reminder: Reminder,
         now: datetime,
         exc: DeliveryError,
-        fence: int,
+        claim: Claim,
     ) -> Delivery | None:
         """Refused, with budget left: try again, further away than last time.
 
@@ -300,7 +454,7 @@ class Reminders:
         holder and have nothing to report.
         """
         retry_at = now + next_delay(reminder.attempt_count)
-        if not self._store.settle_retry(attempt_id, reminder.id, now, str(exc), retry_at, fence):
+        if not self._store.settle_retry(attempt_id, reminder.id, now, str(exc), retry_at, claim):
             return None
         return Delivery(reminder, error=str(exc), retry_at=retry_at)
 
@@ -311,7 +465,7 @@ class Reminders:
         now: datetime,
         exc: DeliveryError,
         outcome: AttemptOutcome,
-        fence: int,
+        claim: Claim,
     ) -> Delivery | None:
         """The end of the road, for one of the two possible reasons.
 
@@ -322,7 +476,7 @@ class Reminders:
         """
         reason: FailureReason = "permanent_error" if outcome == "rejected" else "retries_exhausted"
         if not self._store.settle_failed(
-            attempt_id, reminder.id, now, outcome, str(exc), reason, fence
+            attempt_id, reminder.id, now, outcome, str(exc), reason, claim
         ):
             return None
         return Delivery(reminder, error=str(exc), failure_reason=reason)

@@ -40,20 +40,21 @@ from pathlib import Path
 import pytest
 
 from reminders.delivery import DeduplicatingDestination, LedgerDestination, RefusingDestination
+from reminders.model import Claim
 from reminders.service import Reminders
 from reminders.store import Store
 from tests.shared import DUE_AT, naive
 
 
-def _claim(store: Store, reminder_id: int, worker: str = "w") -> int | None:
+def _claim(store: Store, reminder_id: int, worker: str = "w") -> Claim | None:
     """`store.claim` with the later stages' arguments filled in.
 
     These tests are about *who wins*, not about expiry, so they all claim at
     `DUE_AT` for an hour. Stage 12's own tests are where the window matters.
 
-    Since Stage 13 the return value is the winner's **fencing token** rather than a
-    bare yes -- `None` still means somebody else got there first, which is all
-    these tests look at.
+    Since Stage 13 the return value is the winner's licence rather than a bare yes,
+    and since Stage 14 that licence is a pair. `None` still means somebody else got
+    there first, which is all these tests look at.
     """
     return store.claim(reminder_id, DUE_AT, DUE_AT + timedelta(hours=1), worker)
 

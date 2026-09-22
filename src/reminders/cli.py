@@ -59,7 +59,13 @@ from reminders.delivery import (
     PrintDestination,
     RefusingDestination,
 )
-from reminders.model import Attempt, Delivery, Reminder
+from reminders.model import (
+    Attempt,
+    CannotCancelError,
+    Delivery,
+    Reminder,
+    StaleVersionError,
+)
 from reminders.runner import DEFAULT_POLL_SECONDS, Runner
 from reminders.service import Reminders
 from reminders.store import IN_MEMORY, Store
@@ -73,6 +79,11 @@ HELP = """commands:
   tick <utc-instant>            set the clock there, deliver anything owed
   run <utc-instant>             let the loop run until then
   list                          show everything
+  edit <id> <version> <local-time> <zone> <text>
+                                change it; <version> is what you were looking at
+  cancel <id>                   stop it; no version needed
+  versions <id>                 every version of one reminder
+  sweep                         close attempt records nothing will reach
   attempts <id>                 every attempt against one reminder
   help                          this
   quit                          exit
@@ -90,7 +101,7 @@ def _format(reminder: Reminder, attempts: list[Attempt]) -> str:
     asked = f"{reminder.local_datetime.isoformat()} {reminder.iana_zone}"
     note = "" if reminder.resolution_class == "exact" else f"  [{reminder.resolution_class}]"
     line = (
-        f"  {reminder.id}  {state:<10}  {reminder.due_at.isoformat()}"
+        f"  {reminder.id}  v{reminder.version}  {state:<10}  {reminder.due_at.isoformat()}"
         f"   ({asked}){note}  {reminder.text}"
     )
     trouble = _trouble(reminder, attempts)
@@ -112,6 +123,8 @@ def _state(reminder: Reminder) -> str:
         return "FAILED"
     if reminder.state == "delivered":
         return "delivered"
+    if reminder.state == "cancelled":
+        return "cancelled"
     if reminder.state == "running":
         return "RUNNING"
     return "waiting"
@@ -162,19 +175,24 @@ def _format_attempt(attempt: Attempt) -> str:
     """One line of history. An unfinished attempt is shouted about."""
     if attempt.unfinished:
         return (
-            f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  "
+            f"    {attempt.id:>4}  v{attempt.version}  {attempt.started_at.isoformat()}  "
             "UNFINISHED - a send may have happened"
         )
     if attempt.outcome == "unknown":
-        # The takeover's honest answer, and it is never revised.
+        # `takeover` and `sweep` both write `unknown` and mean different things:
+        # one says a worker was replaced, the other says the record was orphaned
+        # by an ending its worker had no part in.
+        why = "taken over" if attempt.closed_by == "takeover" else "swept"
+        when = attempt.finished_at.isoformat() if attempt.finished_at else "?"
         return (
-            f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  "
-            f"unknown - abandoned, taken over at {attempt.finished_at.isoformat()}"
-            if attempt.finished_at
-            else f"    {attempt.id:>4}  unknown"
+            f"    {attempt.id:>4}  v{attempt.version}  {attempt.started_at.isoformat()}  "
+            f"unknown - {why} at {when}"
         )
     detail = f"  {attempt.error}" if attempt.error else ""
-    return f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  {attempt.outcome}{detail}"
+    return (
+        f"    {attempt.id:>4}  v{attempt.version}  {attempt.started_at.isoformat()}  "
+        f"{attempt.outcome}{detail}"
+    )
 
 
 def _report(deliveries: list[Delivery]) -> None:
@@ -304,7 +322,7 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
     print(
-        f"stage 13 - a worker that has been replaced cannot change anything."
+        f"stage 15 - finished means finished, and the history gets closed."
         f"  store: {where}  poll: {poll}s\n"
     )
     print(HELP)
@@ -370,6 +388,51 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
                         print("  nothing here")
                     for reminder in items:
                         print(_format(reminder, reminders.attempts(reminder.id)))
+
+                case "edit":
+                    parts = rest.split(" ", 4)
+                    if len(parts) < 5 or not parts[4].strip():
+                        print("  usage: edit <id> <version> <local-time> <zone> <text>")
+                        continue
+                    ident, version, when, zone, text = parts
+                    try:
+                        revised = reminders.edit(
+                            int(ident),
+                            int(version),
+                            datetime.fromisoformat(when),
+                            zone,
+                            text.strip(),
+                        )
+                    except StaleVersionError as stale:
+                        # The refusal says what it lost to, so the next command
+                        # can be the same edit against the real version.
+                        print(f"  refused: {stale}")
+                        continue
+                    print(_format(revised, reminders.attempts(revised.id)))
+
+                case "cancel":
+                    if not rest:
+                        print("  usage: cancel <reminder-id>")
+                        continue
+                    try:
+                        stopped = reminders.cancel(int(rest))
+                    except CannotCancelError as refused:
+                        # A different ending, and hiding it would be the worst
+                        # possible silence.
+                        print(f"  refused: {refused}")
+                        continue
+                    print(_format(stopped, reminders.attempts(stopped.id)))
+
+                case "sweep":
+                    closed = reminders.sweep(clock.now())
+                    print(f"  ({closed} attempt record(s) closed as unknown)")
+
+                case "versions":
+                    if not rest:
+                        print("  usage: versions <reminder-id>")
+                        continue
+                    for number, due_at, said, key in reminders.versions(int(rest)):
+                        print(f"    v{number}  {due_at.isoformat()}  {key[:8]}..  {said}")
 
                 case "attempts":
                     if not rest:

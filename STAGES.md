@@ -1531,11 +1531,36 @@ c)  change only the TEXT, leave the time alone
 
 ### What happens
 
-**(a)** The reminder is recorded as delivered — with the text the user just replaced. No claim expired. Nobody was replaced. The worker still holds the current number, so its write is accepted.
+*Measured, all three.*
 
-**(b)** The second save silently overwrites the first. The first person gets a cheerful confirmation for a change that no longer exists. Nothing errors.
+**(a)** The reminder is recorded as delivered — with the text the user just replaced:
 
-**(c)** The corrected message goes out and the destination says *"already handled."* **The correction never arrives.**
+```
+sent:      'Bring your passport'
+row says:  'Bring your DRIVING LICENCE, not your passport'
+state:     delivered   (the worker's write landed: True)
+```
+
+No claim expired. Nobody was replaced. The worker still holds the current number, so its write is accepted.
+
+**(b)** The second save silently overwrites the first:
+
+```
+person 1 saved:  'Call the clinic at 3pm'   (and was thanked)
+person 2 saved:  'Call the dentist'
+row now says:    'Call the dentist'
+```
+
+The first person gets a cheerful confirmation for a change that no longer exists. Nothing errors.
+
+**(c)** The corrected message goes out and the destination says *"already handled."*
+
+```
+received:            ['Meeting at 2pm']
+ignored as repeats:  ['Meeting MOVED to 4pm']
+```
+
+**The correction never arrives**, and this is the worst of the three because it is completely silent — the far side is deduplicating *correctly*.
 
 ### Why
 
@@ -1580,6 +1605,9 @@ Which also means older versions survive, and that turns out to matter at Stage 1
 - **14.4** `version` joins the claim number in every worker write
 - **14.5** the key is derived from the reminder **and its version**
 - **14.6** an edit resets the retry budget — a new intent gets a fair chance
+- **14.7** *corrected while building:* an edit is allowed **from any state**, terminal ones included
+  - **14.7.1** the first version of `edit` refused `delivered` and `failed`, on the reasoning that a kept promise should not be reopened. That was a rule invented without a failure behind it, and experiment (c) — *the meeting moved, send a correction* — contradicted it on the first run. So did *fix the recipient on the one that failed*, which is what 14.6 exists for
+  - **14.7.2** what makes it safe is the versioning itself, and that is the payoff: version 1's delivery record stays exactly where it is, the correction is version 2 with its own key, and the history shows both. Refusing would have left the user creating a second reminder that nothing connects to the first
 
 ### Persistence · state
 
@@ -1597,6 +1625,15 @@ Which also means older versions survive, and that turns out to matter at Stage 1
 - **a text-only edit is delivered** — the failure from (c). The mutation is to drop the version from the key
 - the instant of a superseded version is still readable, unchanged
 - a superseded version's successful send can never become this reminder's delivery
+- **every** worker write is refused after an edit, enumerated one at a time — deliver, retry, fail, abandon, charge. One unguarded path is the whole hole, exactly as at Stage 13
+
+### What the mutations found
+
+Ten were run. All ten were caught, but one deserves recording because it was *not a real mutation*: `INSERT` → `INSERT OR REPLACE` against `intent` passed the suite, and should have. An edit appends version N+1, which collides with nothing, so `OR REPLACE` never replaces anything. Replacing it with a mutation that genuinely rewrites the current version instead of appending fails **fourteen** tests.
+
+Worth noting because a surviving mutation is only evidence of a gap when the mutation actually changes behaviour. This one did not, and reporting it as a hole would have been noise.
+
+The grep test earns its place separately: inserting a real `UPDATE intent` statement into the source fails exactly one test, which is the only thing standing between "a table nothing updates" and "a table nothing updates *yet*".
 
 ### Still broken
 
@@ -1605,6 +1642,12 @@ If the notification already left before the edit landed, it is **gone**. It is o
 What we guarantee is narrower and worth stating precisely: it is not *recorded* as a delivery of current intent, and the history says exactly what was sent and for which version. The reminder shows as scheduled at the new time, with a successful attempt against the old one in its record.
 
 That gap between what happened and what the item says is not a bug. It is information — and the next stage is where it gets its sharpest test.
+
+### Rework this stage caused
+
+Smaller than expected, and the reason is worth keeping: **`Reminder` stayed flat.** Splitting the table into `reminder` and `intent` changed every read into a join, but the object handed back still has `text`, `due_at` and the rest on it, so only seven tests broke — all of them about the fencing token becoming a two-number `Claim`, none about the schema.
+
+The alternative shape — handing callers a `Reminder` with an `intent` object hanging off it — would have pushed the split into every call site and every test in the suite, to express something no caller needed to know.
 
 ### Next question
 
@@ -1629,9 +1672,26 @@ b)  worker starts sending  ->  user cancels  ->  kill -9 the worker
 
 ### What happens
 
-**(a)** Depending on which write lands second, the reminder can end up **cancelled but recorded as delivered** — the one outcome a user would call a bug without hesitating.
+*Measured.*
 
-**(b)** The reminder is cancelled. The attempt record from the killed worker is still **open**, with no ending, and it stays that way **forever**.
+**(a)** The worker succeeds after the cancel lands:
+
+```
+A's write landed: True
+state:            delivered
+```
+
+**Cancelled, and recorded as delivered** — the one outcome a user would call a bug without hesitating.
+
+**(b)** The reminder is cancelled and the killed worker's record is still open:
+
+```
+at +  0d:  due=0  open attempts=1
+at +  1d:  due=0  open attempts=1
+at +365d:  due=0  open attempts=1
+```
+
+No ending, and there never will be one.
 
 ### Why
 
@@ -1683,10 +1743,40 @@ All five states now exist.
 - **no cancelled reminder is left with an open attempt record** — the mutation is to delete the sweep
 - the sweep does not pre-empt a worker that comes back in time
 - a worker whose reminder was cancelled can still record its own outcome — it just cannot touch the reminder
+- **cancelling still works after somebody else edited** — the mutation is to make `cancel` demand a version
+- the sweep leaves a live reminder's attempts alone (the negative control: a sweep that closed everything old would pass every other test here and quietly destroy every in-flight record in the system)
+
+### What the mutations found
+
+Thirteen were run. Eleven were caught as written. Two survived the first pass, and only one of them was a real gap:
+
+**A real gap.** Making `cancel` demand a version passed the **entire suite** — because nothing anywhere cancelled a reminder that had moved on since the caller last looked at it. The no-version decision is the single most consequential choice in this stage and it was completely untested. `test_cancelling_still_works_after_somebody_else_edited` now covers it.
+
+**Not a gap.** The "no grace period" mutation was `started_at <= ? || ''` — string concatenation with an empty string, which changes nothing. Rewriting it to remove the clause outright fails the right test. Same lesson as Stage 14: a surviving mutation is only evidence of a hole when the mutation actually changes behaviour.
+
+### Rework this stage caused, and one design change it forced
+
+Every worker write gained a third condition, so a handful of earlier tests that drove the store directly with a **hand-made licence** stopped working — correctly, because you can no longer open an attempt against a reminder you do not hold. They now claim the way a worker does, via a `hold()` helper in `tests/shared.py`.
+
+The design change is more interesting. Until now, a worker whose reminder write was rejected rolled back **everything**, including its own attempt record — which threw away something worth keeping: *the worker knows what its own send did*, and that is better information than the guess a sweep would eventually write. So the two halves now land independently:
+
+- the **reminder** write stays conditional on the full licence
+- the **attempt** write lands either way, guarded by `outcome IS NULL` so a worker replaced mid-send still cannot revise the `unknown` its successor wrote
+
+One Stage 14 test changed as a result. It asserted that a superseded version's send left its record open; it now asserts the record says `delivered`, against **version 1**, while the reminder does not. The history gained a fact and the item did not change, which is exactly the shape this whole chapter has been arguing for.
+
+### Where `attempt.version` came from
+
+Stage 14 claimed the history said *what was sent and for which version*. That was half true: `intent` kept every version, but nothing connected an attempt to one — you could infer it from timestamps, which is not the record saying it. The sweep needs it (an attempt against a superseded version is one nobody is coming back to answer for), so it exists now, and Stage 14's claim is true rather than nearly true.
 
 ### Still broken
 
 Nothing correctness-shaped that we know of. What is missing is reach: all of this is driven from one terminal.
+
+Two asymmetries are worth carrying forward, because both look arbitrary until you say why:
+
+- **`edit` requires a version; `cancel` does not.** An edit is a revision of a specific earlier state, so it must say which one or two people editing means one silently loses. A cancellation is version-free.
+- **`edit` is allowed on `delivered` and `failed`, and refused on `cancelled`.** The first two are endings the *system* arrived at, and correcting them is ordinary. The third is an ending the **user** chose, and editing it would quietly resurrect exactly what they stopped.
 
 ### Next question
 

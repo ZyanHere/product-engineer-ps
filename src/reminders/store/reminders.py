@@ -1,7 +1,15 @@
-"""The `reminder` table: its schema, its queries, and its row mapping.
+"""The `reminder` table: everything about a reminder that changes.
 
 One table, one module. Nothing here commits -- see `store/__init__.py` for why
 that rule exists and who owns it instead.
+
+Since Stage 14 this is only **half** a reminder. What the user asked for lives in
+`intent`, one row per version, appended and never updated; this table keeps what
+happens to it -- its state, who holds it, what it has spent -- plus a `version`
+pointing at the intent currently in force. Every read here joins the two.
+
+    reminder   state, claim, claim_seq, budget, version pointer
+    intent     local time, zone, instant, text, key   (per version, immutable)
 
 What is deliberately **not** here
 ---------------------------------
@@ -14,29 +22,32 @@ No `CHECK` constraint tying `failure_reason` to `state = 'failed'`. The code onl
 ever writes them together and the schema would accept a `scheduled` row with a
 reason on it. That is a real hole, named in STAGES.md, with no failure behind it
 yet.
+
+Every worker write carries two numbers
+--------------------------------------
+`claim_seq` answers *was I replaced?* and `version` answers *is this still what
+the user wants?* They move on **different events** -- one when a claim changes
+hands, one when the user edits -- so there is always a case where one is current
+and the other is stale, in both directions. Neither can stand in for the other,
+which is why both appear in every `WHERE`.
 """
 
 from __future__ import annotations
 
 import sqlite3
-import uuid
 from datetime import datetime
 from typing import cast
 
-from reminders.model import FailureReason, Reminder, State
+from reminders.model import Claim, FailureReason, Reminder, State
+from reminders.store import intents
 from reminders.timezones import ResolutionClass
 
 __all__ = ["COLUMNS", "REQUIRED_COLUMNS", "SCHEMA", "ReminderTable"]
 
 REQUIRED_COLUMNS = {
     "id",
-    "local_datetime",
-    "iana_zone",
-    "due_at",
-    "resolution_class",
-    "text",
     "state",
-    "idempotency_key",
+    "version",
     "next_attempt_at",
     "claimed_until",
     "claimed_by",
@@ -47,31 +58,17 @@ REQUIRED_COLUMNS = {
 }
 
 COLUMNS = (
-    "id, local_datetime, iana_zone, due_at, resolution_class, text, state, "
-    "idempotency_key, next_attempt_at, claimed_until, claimed_by, claim_seq, "
-    "attempt_count, max_attempts, failure_reason"
+    "r.id, i.local_datetime, i.iana_zone, i.due_at, i.resolution_class, i.text, "
+    "r.state, i.idempotency_key, r.version, r.next_attempt_at, "
+    "r.claimed_until, r.claimed_by, r.claim_seq, "
+    "r.attempt_count, r.max_attempts, r.failure_reason"
 )
+
+_FROM = "FROM reminder r JOIN intent i ON i.reminder_id = r.id AND i.version = r.version"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reminder (
     id             INTEGER PRIMARY KEY,
-
-    -- what the user said, and which rules apply to it. Kept because this is
-    -- the intent; the instant below is only where it happens to land today.
-    local_datetime TEXT    NOT NULL,
-    iana_zone      TEXT    NOT NULL,
-
-    -- the resolved instant: when this became owed. Never rewritten. A retry
-    -- defers the next attempt, it does not change when the reminder was for,
-    -- and collapsing those two would erase how late a delivery actually was.
-    due_at         TEXT    NOT NULL,
-
-    -- which daylight-saving case produced it. NOT NULL on purpose: a nullable
-    -- column could be quietly skipped, which is the exact failure Stage 6
-    -- exists to fix.
-    resolution_class TEXT  NOT NULL,
-
-    text           TEXT    NOT NULL,
 
     -- Stage 8. Was `done INTEGER` until a reminder needed a third outcome:
     -- scheduled, delivered, failed. A boolean made "nobody can ever deliver
@@ -79,13 +76,11 @@ CREATE TABLE IF NOT EXISTS reminder (
     -- three days looking like it was still coming.
     state          TEXT    NOT NULL,
 
-    -- Stage 9. The name the destination knows this reminder by. Written once,
-    -- at creation, and never recomputed -- a derivation that ran at send time
-    -- could be changed by a deploy mid-outage, and the retry it was supposed to
-    -- deduplicate would arrive as a brand-new notification.
-    -- UNIQUE because two reminders sharing a key would silently collapse into
-    -- one at the far side, which is a lost promise that nothing here logs.
-    idempotency_key  TEXT    NOT NULL UNIQUE,
+    -- Stage 14. Which row of `intent` is currently in force. Starts at 1 and is
+    -- incremented by an accepted edit. Carried by every worker write beside
+    -- `claim_seq`, because a worker can be perfectly current about who holds the
+    -- reminder and completely out of date about what it says.
+    version        INTEGER NOT NULL,
 
     -- Stage 7. NULL means no failure is being waited out, which is a different
     -- thing from "tried and it did not work" -- and one boolean could not tell
@@ -124,13 +119,39 @@ class ReminderTable:
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
+        self._intents = intents.IntentTable(connection)
 
     # -- reads --------------------------------------------------------------
 
     def load_all(self) -> list[Reminder]:
-        """Every reminder, in creation order."""
-        rows = self._connection.execute(f"SELECT {COLUMNS} FROM reminder ORDER BY id").fetchall()
+        """Every reminder, in creation order, at its current version."""
+        rows = self._connection.execute(f"SELECT {COLUMNS} {_FROM} ORDER BY r.id").fetchall()
         return [to_reminder(row) for row in rows]
+
+    def get(self, reminder_id: int) -> Reminder | None:
+        """One reminder at its current version, or `None`."""
+        row = self._connection.execute(
+            f"SELECT {COLUMNS} {_FROM} WHERE r.id = ?", (reminder_id,)
+        ).fetchone()
+        return None if row is None else to_reminder(row)
+
+    def at_version(self, reminder_id: int, version: int) -> Reminder | None:
+        """One reminder as a **superseded** version saw it.
+
+        The payoff for `intent` being append-only. A worker mid-send against
+        version 1 can still say what version 1 was, long after the user has moved
+        on -- so the history records what was sent rather than what is current.
+        """
+        row = self._connection.execute(
+            "SELECT r.id, i.local_datetime, i.iana_zone, i.due_at, i.resolution_class, "
+            "i.text, r.state, i.idempotency_key, i.version, r.next_attempt_at, "
+            "r.claimed_until, r.claimed_by, r.claim_seq, "
+            "r.attempt_count, r.max_attempts, r.failure_reason "
+            "FROM reminder r JOIN intent i ON i.reminder_id = r.id "
+            "WHERE r.id = ? AND i.version = ?",
+            (reminder_id, version),
+        ).fetchone()
+        return None if row is None else to_reminder(row)
 
     def due(self, now: datetime) -> list[Reminder]:
         """Reminders that are owed and still open.
@@ -147,16 +168,12 @@ class ReminderTable:
         Since Stage 7 the comparison is against `next_attempt_at` when there is
         one, and that deserves noting for what it is **not**: there is no retry
         queue, no `retrying` state, no scheduler. A reminder waiting out a backoff
-        is an ordinary owed one whose "not before" moved, so everything already
-        built on the due-check -- restart recovery included -- keeps working
-        without being told retries exist.
+        is an ordinary owed one whose "not before" moved.
 
         `state = 'scheduled'` earns its place at Stage 8 and not before. A
         `done = 0` test said the same thing while there were two outcomes; now
         there are four, two of them endings, and the same clause excludes a
-        `failed` row as excludes a delivered one. That is what makes "it is never
-        picked up again" a property of the query rather than something the caller
-        has to remember.
+        `failed` row as excludes a delivered one.
 
         **Stage 12 adds the second half of the question.** Work is available if
         nobody has it *or* if whoever has it has run out of time:
@@ -166,17 +183,20 @@ class ReminderTable:
 
         The second branch is what makes a crashed worker recoverable. Note it says
         nothing about the holder being dead -- only that we are no longer willing
-        to wait, which is a judgement this process can make and "is that worker
-        alive?" is not.
+        to wait.
+
+        Since Stage 14 the instant comes from the **current** version, so an edit
+        that moves the time is picked up here without anything else being told
+        that edits exist.
 
         Comparison works because the timestamps are ISO-8601 text with a fixed
         shape, so SQLite's string ordering and chronological ordering agree.
         """
         rows = self._connection.execute(
-            f"SELECT {COLUMNS} FROM reminder WHERE "
-            "  (state = 'scheduled' AND COALESCE(next_attempt_at, due_at) <= ?) "
-            "  OR (state = 'running' AND claimed_until <= ?) "
-            "ORDER BY due_at, id",
+            f"SELECT {COLUMNS} {_FROM} WHERE "
+            "  (r.state = 'scheduled' AND COALESCE(r.next_attempt_at, i.due_at) <= ?) "
+            "  OR (r.state = 'running' AND r.claimed_until <= ?) "
+            "ORDER BY i.due_at, r.id",
             (now.isoformat(), now.isoformat()),
         ).fetchall()
         return [to_reminder(row) for row in rows]
@@ -192,7 +212,7 @@ class ReminderTable:
         text: str,
         max_attempts: int,
     ) -> Reminder:
-        """Write a new reminder and return it, with the id the database gave it.
+        """Write a new reminder and its first version.
 
         The id comes from the database rather than a counter in memory, because a
         counter in memory restarts at 1 and would collide with everything already
@@ -202,55 +222,127 @@ class ReminderTable:
         tried, and writing `next_attempt_at = due_at` here would make "never
         attempted" indistinguishable from "attempted, and due again now".
 
-        The idempotency key is generated here, once. Two notes on that:
-
-        * it is random rather than derived from the row, which makes it the second
-          non-deterministic input in a system that otherwise bans them (see
-          `clock.py`). The difference is that this one decides *identity*, not
-          *behaviour*: the same reminder behaves the same way whatever its key is,
-          and the key is committed before anything reads it, so it is stable
-          across every restart and retry. That stability is the whole property
-          being bought.
-        * it is not the row id. An id is ours, small, and guessable; handing it to
-          a third party leaks how many reminders exist and collides across
-          environments that share a destination.
+        `max_attempts` is **copied in** rather than read at decision time, so a
+        later change to the default cannot pass judgement on reminders already
+        part-way through their retries.
         """
-        key = uuid.uuid4().hex
         cursor = self._connection.execute(
-            "INSERT INTO reminder "
-            "(local_datetime, iana_zone, due_at, resolution_class, text, state, "
-            " idempotency_key, attempt_count, max_attempts) "
-            "VALUES (?, ?, ?, ?, ?, 'scheduled', ?, 0, ?)",
-            (
-                local_datetime.isoformat(),
-                iana_zone,
-                due_at.isoformat(),
-                resolution_class,
-                text,
-                key,
-                max_attempts,
-            ),
+            "INSERT INTO reminder (state, version, attempt_count, max_attempts) "
+            "VALUES ('scheduled', 1, 0, ?)",
+            (max_attempts,),
+        )
+        reminder_id = int(cursor.lastrowid or 0)
+        key = self._intents.add(
+            reminder_id, 1, local_datetime, iana_zone, due_at, resolution_class, text
         )
         return Reminder(
-            id=int(cursor.lastrowid or 0),
+            id=reminder_id,
             local_datetime=local_datetime,
             iana_zone=iana_zone,
             due_at=due_at,
             resolution_class=resolution_class,
             text=text,
             idempotency_key=key,
+            version=1,
             max_attempts=max_attempts,
         )
 
-    def claim(self, reminder_id: int, now: datetime, until: datetime, worker: str) -> int | None:
-        """Take responsibility for a reminder. Returns whether we got it.
+    def revise(
+        self,
+        reminder_id: int,
+        base_version: int,
+        local_datetime: datetime,
+        iana_zone: str,
+        due_at: datetime,
+        resolution_class: ResolutionClass,
+        text: str,
+    ) -> bool:
+        """Append a new version and point the reminder at it, if `base_version`
+        is still current.
 
-        The whole of Stage 11 is in the `AND state = 'scheduled'`. Two workers both
+        The condition is the whole of 14.3. Two people open the same reminder and
+        both save; without it the second save silently replaces the first, and the
+        first person is thanked for a change that no longer exists. With it, the
+        second save is refused and can be retried against what is actually there.
+
+        Cancelled reminders are edited by nobody: the predicate below only matches
+        a version, so a cancelled row still matches it and an edit would quietly
+        resurrect something the user stopped. The service refuses it before
+        getting here, and that placement is deliberate -- *which endings may be
+        revived* is a product question, not a storage one.
+
+        `state` goes back to `scheduled` because a running claim is now for a
+        version that no longer matters -- and the claim itself is cleared, so the
+        worker holding it is out of date on both counts at once.
+
+        The budget is **reset**. A new intent gets a fair chance: four failures
+        against a wrong phone number say nothing about the corrected one.
+
+        `claim_seq` is deliberately left alone. It counts handovers between
+        workers and an edit is not one; the next claim will move it. The staleness
+        an edit creates is carried by `version`, which is the reason there are two
+        numbers rather than one.
+        """
+        moved = self._connection.execute(
+            "UPDATE reminder SET version = version + 1, state = 'scheduled', "
+            "next_attempt_at = NULL, claimed_until = NULL, claimed_by = NULL, "
+            "attempt_count = 0, failure_reason = NULL "
+            "WHERE id = ? AND version = ?",
+            (reminder_id, base_version),
+        )
+        if moved.rowcount != 1:
+            return False
+        self._intents.add(
+            reminder_id,
+            base_version + 1,
+            local_datetime,
+            iana_zone,
+            due_at,
+            resolution_class,
+            text,
+        )
+        return True
+
+    def cancel(self, reminder_id: int) -> bool:
+        """Stop a reminder, if it has not already ended. Stage 15.
+
+        **No version.** An edit is a revision of a specific earlier state, so it
+        has to say which one -- otherwise two people editing means one silently
+        loses. A cancellation is version-free: *"I do not want this, whatever it
+        currently says."* Requiring a version would refuse a legitimate
+        cancellation because somebody else edited first, which is the worst
+        possible failure for the one operation whose entire job is to stop a
+        notification going out.
+
+        Reachable from `scheduled` and from `running` alike. A worker holding the
+        reminder is not consulted and is not notified -- it finds out the same way
+        it finds out about everything else, by writing and being told nothing
+        changed, because every worker write now also asks *is this still
+        running?*
+
+        Returns whether this call was the one that changed it. `False` means the
+        reminder had already ended, and the caller decides what that means: the
+        service treats "already cancelled" as success and the other endings as a
+        refusal worth reporting.
+        """
+        cursor = self._connection.execute(
+            "UPDATE reminder SET state = 'cancelled', next_attempt_at = NULL, "
+            "claimed_until = NULL, claimed_by = NULL "
+            "WHERE id = ? AND state IN ('scheduled', 'running')",
+            (reminder_id,),
+        )
+        return cursor.rowcount == 1
+
+    def claim(self, reminder_id: int, now: datetime, until: datetime, worker: str) -> Claim | None:
+        """Take responsibility for a reminder. Returns the licence, or `None`.
+
+        The whole of Stage 11 is in the `state = 'scheduled'`. Two workers both
         run this statement; the first changes one row and the second changes none.
-        Nobody had to coordinate, and no worker had to trust another worker's read.
+        Nobody had to coordinate, and no worker had to trust another worker's
+        read.
 
-        **A read cannot exclude anybody** -- that is why discovery could never have
-        solved this. `due()` handing the same row to two workers is fine and
+        **A read cannot exclude anybody** -- that is why discovery could never
+        have solved this. `due()` handing the same row to two workers is fine and
         unavoidable. What was missing was anything happening between reading and
         acting.
 
@@ -265,30 +357,23 @@ class ReminderTable:
         loop each one aborts a whole poll and takes the reminders behind it down.
 
         Writing from the start leaves no snapshot to invalidate. The losers match
-        zero rows and get `False`, which is what makes losing *ordinary* -- somebody
-        else is doing the work, which is the correct outcome and costs the loser
-        nothing.
+        zero rows and get `None`, which is what makes losing *ordinary*.
 
-        **Stage 12 widens the condition rather than adding a second operation.**
-        A claim and a takeover are the same statement:
+        **Stage 12 widens the condition rather than adding a second operation.** A
+        claim and a takeover are the same statement:
 
-            take it if nobody has it        state = 'scheduled'
+            take it if nobody has it              state = 'scheduled'
             or if whoever has it is out of time   claimed_until <= now
 
-        One write covers both, so there is no "is this a fresh claim or a
-        takeover?" branch anywhere, and no window between checking and taking.
+        `claimed_until` is wall-clock, because the process that reads it next is
+        not this one. It records that nobody else will take the work before then
+        -- **not** that this worker will still be alive.
 
-        `claimed_until` is written here and is wall-clock, because the process
-        that reads it next is not this one. It records that nobody else will take
-        the work before then -- **not** that this worker will still be alive.
-
-        **Stage 13** makes the same statement bump `claim_seq` and hand it back.
-        That number is the winner's licence to write: every subsequent write it
-        makes carries the value returned here, and the previous holder's copy is
-        now one behind. `RETURNING` keeps it to one statement, so there is no
-        window in which the claim has been taken but its token is unknown.
-
-        Returns the new token, or `None` for a claim that was not won.
+        **Stage 13** makes the same statement bump `claim_seq`, and **Stage 14**
+        hands back the `version` alongside it. Those two numbers together are the
+        winner's licence to write: what it holds, and what it believes the user
+        wants. `RETURNING` keeps it to one statement, so there is no window in
+        which the claim has been taken but its licence is unknown.
         """
         cursor = self._connection.execute(
             "UPDATE reminder SET state = 'running', claimed_until = ?, claimed_by = ?, "
@@ -296,13 +381,13 @@ class ReminderTable:
             "WHERE id = ? AND ("
             "  state = 'scheduled' OR (state = 'running' AND claimed_until <= ?)"
             ") "
-            "RETURNING claim_seq",
+            "RETURNING claim_seq, version",
             (until.isoformat(), worker, reminder_id, now.isoformat()),
         )
         row = cursor.fetchone()
-        return None if row is None else int(row[0])
+        return None if row is None else Claim(seq=int(row[0]), version=int(row[1]))
 
-    def charge_attempt(self, reminder_id: int, fence: int) -> bool:
+    def charge_attempt(self, reminder_id: int, claim: Claim) -> bool:
         """Spend one attempt from the budget. Stage 10.
 
         The **only** place the counter moves, and it is called when an attempt is
@@ -322,16 +407,17 @@ class ReminderTable:
         would otherwise charge a budget it no longer has any business spending.
         """
         cursor = self._connection.execute(
-            "UPDATE reminder SET attempt_count = attempt_count + 1 WHERE id = ? AND claim_seq = ?",
-            (reminder_id, fence),
+            "UPDATE reminder SET attempt_count = attempt_count + 1 "
+            "WHERE id = ? AND state = 'running' AND claim_seq = ? AND version = ?",
+            (reminder_id, claim.seq, claim.version),
         )
         return cursor.rowcount == 1
 
-    def mark_delivered(self, reminder_id: int, fence: int) -> bool:
+    def mark_delivered(self, reminder_id: int, claim: Claim) -> bool:
         """It went out. Terminal, and nothing is being waited out any more."""
-        return self._settle(reminder_id, "state = 'delivered', next_attempt_at = NULL", (), fence)
+        return self._settle(reminder_id, "state = 'delivered', next_attempt_at = NULL", (), claim)
 
-    def defer(self, reminder_id: int, next_attempt_at: datetime, fence: int) -> bool:
+    def defer(self, reminder_id: int, next_attempt_at: datetime, claim: Claim) -> bool:
         """Refused, with budget left. Back to `scheduled`, just not yet.
 
         Since Stage 11 this has to say `state = 'scheduled'` out loud, and
@@ -354,10 +440,10 @@ class ReminderTable:
             reminder_id,
             "state = 'scheduled', next_attempt_at = ?",
             (next_attempt_at.isoformat(),),
-            fence,
+            claim,
         )
 
-    def fail(self, reminder_id: int, reason: FailureReason, fence: int) -> bool:
+    def fail(self, reminder_id: int, reason: FailureReason, claim: Claim) -> bool:
         """Terminal failure, with the reason recorded.
 
         `next_attempt_at` is cleared because a closed reminder has no next
@@ -368,10 +454,12 @@ class ReminderTable:
             reminder_id,
             "state = 'failed', failure_reason = ?, next_attempt_at = NULL",
             (reason,),
-            fence,
+            claim,
         )
 
-    def _settle(self, reminder_id: int, sets: str, params: tuple[object, ...], fence: int) -> bool:
+    def _settle(
+        self, reminder_id: int, sets: str, params: tuple[object, ...], claim: Claim
+    ) -> bool:
         """Move the reminder to wherever this outcome puts it.
 
         Since Stage 10 this does **not** touch `attempt_count`. The budget was
@@ -380,26 +468,29 @@ class ReminderTable:
 
         Since Stage 12 it **always clears the claim**. Whatever this outcome was,
         this worker is done with the reminder, and a `claimed_until` left behind on
-        a delivered row would be a lie that outlives its subject. On a deferral it
-        matters more than cosmetically: the row goes back to `scheduled`, and a
-        stale expiry sitting beside it is the sort of thing a later query gets
-        wrong.
+        a delivered row would be a lie that outlives its subject.
 
-        Since Stage 13 it carries the caller's fencing token and returns whether
-        the write landed. `claim_seq` is deliberately **not** bumped here: a
-        settlement ends this worker's turn, it does not begin anybody's, and the
-        next claim will move the number itself.
+        Since Stage 13 it carries the caller's fencing token, and since Stage 14
+        the version too. `claim_seq` is deliberately not bumped here: a settlement
+        ends this worker's turn, it does not begin anybody's.
+
+        **Stage 15 adds the third question.** The first two ask *is this still
+        current?* -- and a cancellation makes neither of them false, because
+        nobody was replaced and nothing was edited. `state = 'running'` is what
+        asks *has this already finished?*, and without it a cancelled reminder
+        could still be recorded as delivered, which is the one outcome a user
+        would call a bug without hesitating.
         """
         cursor = self._connection.execute(
             f"UPDATE reminder SET {sets}, claimed_until = NULL, claimed_by = NULL "
-            "WHERE id = ? AND claim_seq = ?",
-            (*params, reminder_id, fence),
+            "WHERE id = ? AND state = 'running' AND claim_seq = ? AND version = ?",
+            (*params, reminder_id, claim.seq, claim.version),
         )
         return cursor.rowcount == 1
 
 
 def to_reminder(row: tuple[object, ...]) -> Reminder:
-    """One database row as a Reminder."""
+    """One joined row as a Reminder: what happens to it, plus what it says."""
     return Reminder(
         id=int(row[0]),  # type: ignore[call-overload]
         local_datetime=datetime.fromisoformat(str(row[1])),
@@ -409,13 +500,14 @@ def to_reminder(row: tuple[object, ...]) -> Reminder:
         text=str(row[5]),
         state=cast("State", str(row[6])),
         idempotency_key=str(row[7]),
-        next_attempt_at=optional_instant(row[8]),
-        claimed_until=optional_instant(row[9]),
-        claimed_by=None if row[10] is None else str(row[10]),
-        claim_seq=int(row[11]),  # type: ignore[call-overload]
-        attempt_count=int(row[12]),  # type: ignore[call-overload]
-        max_attempts=int(row[13]),  # type: ignore[call-overload]
-        failure_reason=None if row[14] is None else cast("FailureReason", str(row[14])),
+        version=int(row[8]),  # type: ignore[call-overload]
+        next_attempt_at=optional_instant(row[9]),
+        claimed_until=optional_instant(row[10]),
+        claimed_by=None if row[11] is None else str(row[11]),
+        claim_seq=int(row[12]),  # type: ignore[call-overload]
+        attempt_count=int(row[13]),  # type: ignore[call-overload]
+        max_attempts=int(row[14]),  # type: ignore[call-overload]
+        failure_reason=None if row[15] is None else cast("FailureReason", str(row[15])),
     )
 
 

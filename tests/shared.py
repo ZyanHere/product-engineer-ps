@@ -20,11 +20,16 @@ destination, which clock, and in what order they were opened.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from reminders.delivery import NullDestination
 
-__all__ = ["DUE_AT", "START", "SUCCEEDS", "naive"]
+if TYPE_CHECKING:
+    from reminders.model import Claim
+    from reminders.store import Store
+
+__all__ = ["DUE_AT", "START", "SUCCEEDS", "hold", "naive"]
 
 START = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
 """A plain instant to start a clock at. One hour before `DUE_AT`."""
@@ -57,3 +62,19 @@ def naive(instant: datetime) -> datetime:
     which resolves to exactly the instants they always used.
     """
     return instant.replace(tzinfo=None)
+
+
+def hold(store: Store, reminder_id: int, at: datetime = DUE_AT) -> Claim:
+    """Claim a reminder the way a worker does, and hand back the licence.
+
+    Since Stage 15 an attempt can only be opened against a reminder this worker
+    is actually holding -- every worker write asks *is this still running?* Tests
+    that drive the store directly used to pass a hand-made licence, which
+    worked only while nothing checked the state.
+
+    The claim lasts an hour, because none of the tests using this are about
+    expiry; Stage 12's own tests are where the window matters.
+    """
+    claim = store.claim(reminder_id, at, at + timedelta(hours=1), "test-worker")
+    assert claim is not None, f"could not claim reminder {reminder_id}"
+    return claim

@@ -43,13 +43,7 @@ from reminders.model import Reminder
 from reminders.runner import Runner
 from reminders.service import Reminders
 from reminders.store import Store
-from tests.shared import DUE_AT, naive
-
-# A reminder nobody has claimed has `claim_seq = 0`, and Stage 13 requires every
-# worker write to carry the current one. Tests that drive the store directly,
-# without a claim, pass 0 for it. A real worker can never hold 0: `claim()` bumps
-# the counter before handing it back, so the first token it can ever return is 1.
-UNCLAIMED = 0
+from tests.shared import DUE_AT, hold, naive
 
 # -- the headline ------------------------------------------------------------
 
@@ -319,8 +313,9 @@ def test_ordering_is_stable_when_every_attempt_shares_one_instant() -> None:
     reminders = Reminders(store, RefusingDestination())
     created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=50)
 
+    held = hold(store, created.id)
     for _ in range(20):
-        store.open_attempt(created.id, DUE_AT, UNCLAIMED)  # same instant, twenty times
+        store.open_attempt(created.id, DUE_AT, held)  # same instant, twenty times
 
     history = store.attempts(created.id)
     assert len(history) == 20
@@ -344,11 +339,10 @@ def test_ordering_survives_a_clock_that_went_backwards() -> None:
     reminders = Reminders(store, RefusingDestination())
     created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=50)
 
-    first = store.open_attempt(created.id, DUE_AT, UNCLAIMED)
-    second = store.open_attempt(
-        created.id, DUE_AT - timedelta(hours=1), UNCLAIMED
-    )  # clock stepped back
-    third = store.open_attempt(created.id, DUE_AT + timedelta(minutes=1), UNCLAIMED)
+    held = hold(store, created.id)
+    first = store.open_attempt(created.id, DUE_AT, held)
+    second = store.open_attempt(created.id, DUE_AT - timedelta(hours=1), held)  # clock stepped back
+    third = store.open_attempt(created.id, DUE_AT + timedelta(minutes=1), held)
 
     assert [a.id for a in store.attempts(created.id)] == [first, second, third]
 
@@ -379,8 +373,12 @@ def test_an_attempt_cannot_name_a_reminder_that_does_not_exist() -> None:
     import sqlite3
 
     store = Store.open()
+    real = Reminders(store, RefusingDestination()).create(naive(DUE_AT), "UTC", "real")
+    held = hold(store, real.id)
+
+    # A licence for a reminder that exists, pointed at one that does not.
     with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
-        store.open_attempt(999, DUE_AT, UNCLAIMED)
+        store.open_attempt(999, DUE_AT, held)
 
 
 # -- no transaction across the send -----------------------------------------

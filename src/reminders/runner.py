@@ -41,6 +41,14 @@ seconds under a sixty-second poll is a sixty-second wait. That is a rounding
 error in favour of waiting longer, which is the safe direction -- it can only
 ever hit the destination less often than asked, never more.
 
+Stage 15 note: the loop does housekeeping too
+---------------------------------------------
+Each pass also sweeps attempt records nothing will ever reach -- the ones left by
+a reminder that ended in a way no takeover follows. It is a separate call rather
+than something `tick` does quietly, because delivering and tidying answer
+different questions and fail in different ways, and a poll that silently did both
+would make "why did nothing get delivered?" harder to answer.
+
 Stage 8 note: still only latency
 --------------------------------
 Stage 8 gave a reminder a way to end in `failed`, which is the first time this
@@ -102,7 +110,9 @@ class Runner:
         """
         attempts: list[Delivery] = []
         while self._clock.now() < horizon:
-            attempts.extend(self._reminders.tick(self._clock.now()))
+            now = self._clock.now()
+            attempts.extend(self._reminders.tick(now))
+            self._reminders.sweep(now)
             self._clock.sleep(self._poll_seconds)
         return attempts
 
@@ -116,5 +126,7 @@ class Runner:
         is Stage 11.
         """
         while True:
-            self._reminders.tick(self._clock.now())
+            now = self._clock.now()
+            self._reminders.tick(now)
+            self._reminders.sweep(now)
             self._clock.sleep(self._poll_seconds)

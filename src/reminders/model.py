@@ -58,19 +58,76 @@ from reminders.timezones import ResolutionClass
 __all__ = [
     "Attempt",
     "AttemptOutcome",
+    "CannotCancelError",
+    "Claim",
+    "ClosedBy",
     "Delivery",
     "FailureReason",
     "Reminder",
+    "StaleVersionError",
     "State",
 ]
 
-State = Literal["scheduled", "running", "delivered", "failed"]
-"""Where a reminder is.
+
+@dataclass(frozen=True, slots=True)
+class Claim:
+    """A worker's licence to write about one reminder. Stage 14.
+
+    Two numbers, because there are two ways to be out of date and they move on
+    **different events**:
+
+        seq       was I replaced?            moves when a claim changes hands
+        version   is this still wanted?      moves when the user edits
+
+    So there is always a case where one is current and the other is stale, in
+    both directions:
+
+        claim expires, user does nothing     seq moved, version did not
+        user edits, nobody was replaced      version moved, seq did not
+
+    Neither can stand in for the other, which is why both appear in the `WHERE`
+    of every write a worker makes. Carrying them together as one value is what
+    stops a future write path remembering one and forgetting the other.
+    """
+
+    seq: int
+    version: int
+
+
+class CannotCancelError(Exception):
+    """A reminder that has already ended cannot be cancelled.
+
+    Carries `state` so the caller is told *which* ending it hit. Reporting
+    success would be the worst possible silence: somebody who cancelled a
+    reminder because it must not go out deserves to know it already did.
+    """
+
+    def __init__(self, state: State) -> None:
+        super().__init__(f"reminder has already {state}; it cannot be cancelled")
+        self.state = state
+
+
+class StaleVersionError(Exception):
+    """An edit was based on a version that is no longer current.
+
+    Carries `current` so the caller can re-read and try again, which is the whole
+    point: a refusal that does not say what it lost to is one the user cannot act
+    on.
+    """
+
+    def __init__(self, current: int) -> None:
+        super().__init__(f"reminder has moved on; it is now at version {current}")
+        self.current = current
+
+
+State = Literal["scheduled", "running", "delivered", "failed", "cancelled"]
+"""Where a reminder is. All five now exist.
 
     scheduled   owed, or waiting out a backoff. Available to be picked up.
     running     a worker has taken responsibility for it. Stage 11.
     delivered   it went out
     failed      it is not going out, and the row says why
+    cancelled   the user stopped it. Stage 15.
 
 Was a boolean until Stage 8. A boolean could hold "it worked" and "not yet",
 which forced the third case -- *nobody is ever going to deliver this* -- to hide
@@ -83,9 +140,25 @@ work and doing work had never been separated -- every worker that could *see* a
 reminder considered itself entitled to *act* on it. There was no way for the data
 to say "taken".
 
-**Nothing says how long a `running` reminder may stay that way**, which is the
-next thing to break: a worker killed while holding one leaves a row nobody will
-ever pick up again.
+`cancelled` arrived at Stage 15, and it is the first ending **somebody other
+than the worker** can cause. Every guard before it asked *is this still
+current?* -- is my claim current, is my version current -- and a cancellation
+makes neither of those false. It needed a third question, asked by every worker
+write: *has this already finished?*
+"""
+
+ClosedBy = Literal["owner", "takeover", "sweep"]
+"""Who wrote the ending on an attempt record. Stage 15.
+
+    owner      the worker that opened it came back and said what happened
+    takeover   somebody took the reminder over and closed what was left
+    sweep      nothing was ever going to reach it, so a sweep closed it
+
+`owner` is a real answer. The other two are the same value -- `unknown` -- with
+very different stories behind them, and they call for different responses: a
+takeover means a worker was replaced, a sweep means a record was orphaned by an
+ending the worker had no part in. Collapsing them would make every
+investigation start by guessing which happened.
 """
 
 AttemptOutcome = Literal["delivered", "refused", "rejected", "unknown"]
@@ -153,7 +226,7 @@ class Reminder:
     """Scheduled, delivered, or failed."""
 
     idempotency_key: str = ""
-    """The name the destination knows this reminder by. Stage 9.
+    """The name the destination knows this **version** by. Stage 9, revised at 14.
 
     Generated once, when the row is created, and **never recomputed**. Two
     things follow from "never", and they are the whole point:
@@ -172,8 +245,25 @@ class Reminder:
     survive. Why not the text: two genuinely different reminders that happen to
     say the same thing would collapse into one.
 
-    Stage 14 revisits this, when the user edits a reminder and "the same thing"
-    stops being obvious.
+    **Stage 14 moved it from the reminder to the version**, which is where Stage
+    9's own reasoning was always heading. Naming it after "the reminder" was right
+    while a reminder had one meaning forever. It now has several over time, and a
+    corrected message reusing the old key is thrown away by the far side as a
+    repeat -- so the correction never arrives, which is the worst of the three
+    edit failures because it is completely silent.
+    """
+
+    version: int = 1
+    """Which intent is in force. Stage 14.
+
+    Starts at 1 and moves only when the user's request changes. The fields above
+    -- the time, the zone, the text, the key -- are the facts of *this* version,
+    read from a table that has no update statement anywhere in the codebase.
+
+    An edit cannot rewrite them; it can only append a new version and move this
+    pointer. That is deliberately structural rather than a rule somebody has to
+    remember, because the failure it prevents is a worker resolving a reminder,
+    starting to send, and having the row rewritten underneath it.
     """
 
     next_attempt_at: datetime | None = None
@@ -286,9 +376,23 @@ class Attempt:
     id: int
     reminder_id: int
     started_at: datetime
+    version: int = 1
+    """Which intent this send was for. Stage 15.
+
+    Stage 14 claimed the history said *what was sent and for which version*, and
+    that was half true: `intent` kept every version, but nothing connected an
+    attempt to one. You could infer it from timestamps, which is not the same as
+    the record saying it.
+
+    It also makes the sweep possible: an attempt against a superseded version is
+    one nobody is coming back to answer for.
+    """
+
     finished_at: datetime | None = None
     outcome: AttemptOutcome | None = None
     error: str | None = None
+    closed_by: ClosedBy | None = None
+    """Who wrote the ending. `None` while it has none."""
 
     @property
     def unfinished(self) -> bool:

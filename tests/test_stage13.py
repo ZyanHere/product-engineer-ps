@@ -42,7 +42,7 @@ from pathlib import Path
 import pytest
 
 from reminders.delivery import DeliveryError, LedgerDestination, RefusingDestination
-from reminders.model import Reminder
+from reminders.model import Claim, Reminder
 from reminders.service import Reminders
 from reminders.store import Store
 from tests.shared import DUE_AT, naive
@@ -58,8 +58,8 @@ def _one(path: Path, text: str = "Call the clinic", **kwargs: int) -> tuple[Stor
     return store, created.id
 
 
-def _replaced(store: Store, rid: int) -> tuple[int, int, int]:
-    """A claims and starts sending; B takes over. Returns A's token, A's attempt, B's.
+def _replaced(store: Store, rid: int) -> tuple[Claim, int, Claim]:
+    """A claims and starts sending; B takes over. Returns A's licence, A's attempt, B's.
 
     The shape of every test below: one worker that is *still alive* and no longer
     in charge.
@@ -88,7 +88,7 @@ def test_every_claim_moves_the_number(tmp_path: Path) -> None:
     finally:
         store.close()
 
-    assert (first, second, third) == (1, 2, 3)
+    assert [c.seq for c in (first, second, third) if c] == [1, 2, 3]
 
 
 def test_a_lost_claim_does_not_move_the_number(tmp_path: Path) -> None:
@@ -97,8 +97,9 @@ def test_a_lost_claim_does_not_move_the_number(tmp_path: Path) -> None:
     store, rid = _one(tmp_path / "r.db")
     try:
         held = store.claim(rid, DUE_AT, DUE_AT + CLAIM, "A")
+        assert held is not None
         assert store.claim(rid, DUE_AT, DUE_AT + CLAIM, "B") is None
-        assert store.load_all()[0].claim_seq == held
+        assert store.load_all()[0].claim_seq == held.seq
     finally:
         store.close()
 
@@ -112,7 +113,7 @@ def test_a_settlement_does_not_move_the_number(tmp_path: Path) -> None:
         attempt = store.open_attempt(rid, DUE_AT, fence)
         assert attempt is not None
         store.settle_retry(attempt, rid, DUE_AT, "refused", DUE_AT + CLAIM, fence)
-        assert store.load_all()[0].claim_seq == fence
+        assert store.load_all()[0].claim_seq == fence.seq
     finally:
         store.close()
 

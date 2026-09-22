@@ -43,13 +43,7 @@ from reminders.model import Reminder
 from reminders.runner import Runner
 from reminders.service import Reminders
 from reminders.store import Store
-from tests.shared import DUE_AT, naive
-
-# A reminder nobody has claimed has `claim_seq = 0`, and Stage 13 requires every
-# worker write to carry the current one. Tests that drive the store directly,
-# without a claim, pass 0 for it. A real worker can never hold 0: `claim()` bumps
-# the counter before handing it back, so the first token it can ever return is 1.
-UNCLAIMED = 0
+from tests.shared import DUE_AT, hold, naive
 
 
 def _crash_loop(path: Path, times: int, budget: int = 3) -> tuple[LedgerDestination, Reminder]:
@@ -302,9 +296,10 @@ def test_the_charge_and_the_attempt_row_are_one_transaction() -> None:
     reminders = Reminders(store, RefusingDestination())
     reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
+    held = hold(store, 1)  # claiming is its own transaction; trace only the open
     statements: list[str] = []
     store.trace(statements.append)
-    store.open_attempt(1, DUE_AT, UNCLAIMED)
+    store.open_attempt(1, DUE_AT, held)
     store.trace(None)
 
     assert statements[0] == "BEGIN"
