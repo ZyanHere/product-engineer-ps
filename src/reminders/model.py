@@ -50,7 +50,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, final
 
 from reminders.retry import MAX_ATTEMPTS
 from reminders.timezones import ResolutionClass
@@ -60,6 +60,7 @@ __all__ = [
     "AttemptOutcome",
     "CannotCancelError",
     "Claim",
+    "ClaimResult",
     "ClosedBy",
     "Delivery",
     "FailureReason",
@@ -92,6 +93,50 @@ class Claim:
 
     seq: int
     version: int
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ClaimResult:
+    """What the merged claim-and-begin transaction produced. Stage 17 / §0.4.
+
+    Before this existed, claiming a reminder and opening its attempt record were
+    **two separate transactions**. A crash between them left a reminder in
+    `running` with no attempt row and **no budget spent** -- reclaimable, but a
+    deterministic crash loop never ran out of road, because nothing was ever
+    charged. Stage 10 bounded the retries and that gap quietly un-bounded them
+    again, which is the same shape as Stage 9 routing around Stage 8: *a
+    mechanism can be correct and still be defeated by a later one that routes
+    around it.* Deleting the boundary between the two commits is how it closes.
+
+    Three outcomes, and the caller's response is different for each:
+
+        claimed     the normal case: an attempt row exists and the budget has
+                    been charged. Proceed to send.
+
+        reconciled  a successful attempt for the current version already
+                    existed, so delivery was committed without re-sending.
+                    **No path through `Reminders` produces this state** -- see
+                    `Store.claim_and_begin`. It is a guard against a shape this
+                    architecture already prevents, kept because the cost of
+                    being wrong is a duplicate notification.
+
+        exhausted   the budget was already gone (from prior crash-charged
+                    attempts). The reminder is now `failed`. Nothing to send.
+    """
+
+    claim: Claim
+    """The fencing licence for subsequent writes. Always present."""
+
+    attempt_id: int = 0
+    """The attempt record opened inside this transaction.
+
+    Only meaningful when `kind == "claimed"`. For `reconciled` and `exhausted`
+    the terminal state has already been committed, so no attempt is opened.
+    """
+
+    kind: Literal["claimed", "reconciled", "exhausted"] = "claimed"
+    """Which of the three outcomes obtained."""
 
 
 class CannotCancelError(Exception):

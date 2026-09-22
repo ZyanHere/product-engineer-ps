@@ -46,7 +46,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from reminders.model import Attempt, AttemptOutcome, Claim, FailureReason, Reminder
+from reminders.model import Attempt, AttemptOutcome, Claim, ClaimResult, FailureReason, Reminder
 from reminders.store import attempts as attempt_table
 from reminders.store import intents as intent_table
 from reminders.store import reminders as reminder_table
@@ -188,6 +188,92 @@ class Store:
             if claim is not None:
                 self._attempts.close_unfinished(reminder_id, now)
         return claim
+
+    def claim_and_begin(
+        self, reminder_id: int, now: datetime, until: datetime, worker: str
+    ) -> ClaimResult | None:
+        """Take a reminder and open an attempt, atomically. Stage 17 / §0.4.
+
+        **This is the B0 fix.** Before this method existed, claiming and opening
+        an attempt were two separate commits. A crash between them left a row in
+        `running` with no attempt record and no budget spent, so a deterministic
+        crash loop could claim the same reminder forever without ever running out
+        of road.
+
+        One transaction now does everything the architecture says must not have a
+        gap between any two steps:
+
+        1. **Claim**: fence++, lease, holder.
+        2. **Sweep**: close whatever the predecessor left open as `unknown`.
+        3. **B4 reconciliation**: if a successful attempt for the current version
+           already exists, commit the delivery and return `reconciled`.
+        4. **Exhaustion check**: if the budget is already gone, commit `failed`
+           and return `exhausted`.
+        5. **Charge and open**: `attempt_count++`, INSERT attempt.
+
+        The earliest possible crash after this commit is B1 (attempt row exists,
+        budget spent), which is recoverable by design.
+        """
+        self._connection.execute("BEGIN")
+        try:
+            # -- 1. Claim -------------------------------------------------------
+            claim = self._reminders.claim(reminder_id, now, until, worker)
+            if claim is None:
+                self._connection.commit()
+                return None
+
+            # -- 2. Sweep -------------------------------------------------------
+            self._attempts.close_unfinished(reminder_id, now)
+
+            # -- 3. Reconciliation ----------------------------------------------
+            # If a successful attempt for the current version already exists,
+            # commit the delivery rather than sending again.
+            #
+            # **No path through `Reminders` produces this state**, and saying so
+            # is better than implying otherwise. Closing an attempt and settling
+            # its reminder are one transaction, so "succeeded but crashed before
+            # the terminal commit" is not something this codebase can leave
+            # behind -- a crash there rolls back both halves and the record is
+            # swept to `unknown`, not `delivered`. Only `close_attempt_only`
+            # reaches it, and nothing in the service calls that.
+            #
+            # Kept anyway: the cost of being wrong here is a duplicate
+            # notification, which is the most expensive failure this system has,
+            # and the check is one indexed read. See `test_stage17.py`.
+            success_row = self._connection.execute(
+                "SELECT id FROM attempt "
+                "WHERE reminder_id = ? AND version = ? AND outcome = 'delivered'",
+                (reminder_id, claim.version),
+            ).fetchone()
+            if success_row is not None:
+                self._reminders.mark_delivered(reminder_id, claim)
+                self._connection.commit()
+                return ClaimResult(claim=claim, kind="reconciled")
+
+            # -- 4. Exhaustion check --------------------------------------------
+            counts = self._connection.execute(
+                "SELECT attempt_count, max_attempts FROM reminder WHERE id = ?",
+                (reminder_id,),
+            ).fetchone()
+            if counts is not None and int(counts[0]) >= int(counts[1]):
+                self._reminders.fail(reminder_id, "retries_exhausted", claim)
+                self._connection.commit()
+                return ClaimResult(claim=claim, kind="exhausted")
+
+            # -- 5. Charge budget and open attempt ------------------------------
+            if not self._reminders.charge_attempt(reminder_id, claim):
+                # Should not happen: we just claimed successfully with this
+                # fence and version. If it does, treat it as a lost claim.
+                self._connection.rollback()
+                return None
+
+            attempt_id = self._attempts.start(reminder_id, claim.version, now)
+
+            self._connection.commit()
+            return ClaimResult(claim=claim, attempt_id=attempt_id)
+        except BaseException:
+            self._connection.rollback()
+            raise
 
     def insert(
         self,

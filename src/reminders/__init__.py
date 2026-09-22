@@ -1,9 +1,9 @@
 """Durable reminders and scheduled follow-ups.
 
-Built by the sequence in STAGES.md: something small that works, then break it,
+Built by the sequence in docs/STAGES.md: something small that works, then break it,
 then fix the one real problem that broke.
 
-Right now: Stage 15. A reminder is created in a local time and a zone, stored,
+Right now: Stage 17. A reminder is created in a local time and a zone, stored,
 delivered when it is owed, and -- if the destination refuses -- the refusal is
 written down, the next attempt is further away than the last, and the retrying
 ends, either because the budget ran out or because the destination said something
@@ -33,8 +33,15 @@ A reminder can be cancelled, before it fires or in the middle of a send, and the
 record stays truthful. Attempt records that nothing would ever reach are closed by
 a sweep -- as *we never found out*, marked as swept rather than answered.
 
-Nothing correctness-shaped is known to be missing. What is missing is **reach**:
-all of this is driven from one terminal.
+Stage 16 (an HTTP API) was skipped deliberately -- everything is driven from the
+CLI, and the service layer is already the seam an API would sit on.
+
+Stage 17 runs it all at once: twenty-four reminders across two zones, every
+ending the system has, and a **real subprocess killed mid-send**. Forty-three
+presentations crossed the boundary and twenty-four notifications arrived, with no
+key delivered twice.
+
+    python -m reminders.benchmark
 
 And a limit worth repeating, because it is easy to over-claim: if a notification
 has already left, it is gone. No condition in a database reaches into the world

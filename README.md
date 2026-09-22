@@ -2,6 +2,30 @@
 
 > **Before you begin:** Read this README and your selected problem brief completely before starting. If anything is unclear, contact us using whichever option you prefer: [hr@caygnus.com](mailto:hr@caygnus.com) or [Omkar Sonawane on LinkedIn](https://www.linkedin.com/in/omkar-sonawane-ss/).
 
+---
+
+## This fork: Problem 3 — Durable Reminders and Follow-Ups
+
+This is a completed submission, not an empty fork. Everything below this section
+is the original challenge README, unmodified.
+
+| | |
+| --- | --- |
+| **The submission** | [`SUBMISSION.md`](SUBMISSION.md) — start here; it stands alone |
+| **The code** | [`src/reminders/`](src/reminders/) — the package, ~2,300 lines |
+| **The tests** | [`tests/`](tests/) — 279 tests, one file per build stage |
+| **The reasoning** | [`docs/`](docs/README.md) — analysis, correctness model, architecture, build plan, stage log |
+| **Throwaway databases** | [`scratch/`](scratch/README.md) — git-ignored |
+
+```bash
+python -m venv .venv
+.venv/Scripts/pip install -e ".[dev]"      # Linux/macOS: .venv/bin/pip
+python -m reminders                        # the prompt; `help` lists the commands
+.venv/Scripts/python -m pytest             # 279 tests
+```
+
+---
+
 We are hiring a **Product Engineer / Full-Stack Developer** to build and ship products in the AI space at Caygnus. The role is available in a **remote or hybrid** working arrangement.
 
 We care less about years of experience than evidence: what you have shipped, the complexity or scale you have handled, and how you make engineering and product decisions.

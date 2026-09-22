@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 # ---------------------------------------------------------------------------
 # Runtime dependencies
 #
-# One, added at the stage that needed it (STAGES.md, rule 1).
+# One, added at the stage that needed it (docs/STAGES.md, rule 1).
 #
 # tzdata (Stage 5): `zoneinfo` ships no data of its own -- it borrows the
 #   operating system's time-zone database. Windows has none at all, and slim
@@ -81,7 +81,7 @@ select = [
 ]
 
 # ---------------------------------------------------------------------------
-# The real-time ban (STAGES.md, Stage 4)
+# The real-time ban (docs/STAGES.md, Stage 4)
 #
 # Stage 4 introduced a clock, so this rule only now has something to guard.
 # `src/reminders/clock.py` is the one file allowed to read the wall clock or

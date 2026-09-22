@@ -381,27 +381,34 @@ class Reminders:
         deliveries: list[Delivery] = []
 
         for reminder in self._store.due(now):
-            claim = self._store.claim(reminder.id, now, now + self._claim_for, self._worker)
-            if claim is None:
+            result = self._store.claim_and_begin(
+                reminder.id, now, now + self._claim_for, self._worker
+            )
+            if result is None:
                 continue  # somebody else has it. Nothing to do, nothing to undo.
 
-            if reminder.attempts_left() == 0:
-                # Charged for attempts that never reported back. Nothing left to
-                # spend, so nothing is sent and nothing is charged -- it is simply
-                # closed, and says why.
-                if self._store.abandon(reminder.id, "retries_exhausted", claim):
-                    deliveries.append(
-                        Delivery(
-                            reminder,
-                            error="gave up without trying: no attempts left",
-                            failure_reason="retries_exhausted",
-                        )
-                    )
+            if result.kind == "reconciled":
+                # B4: a prior holder's successful attempt was found and the
+                # delivery has been committed without re-sending.
+                deliveries.append(Delivery(reminder))
                 continue
 
-            attempt_id = self._store.open_attempt(reminder.id, now, claim)
-            if attempt_id is None:
-                continue  # replaced between claiming and recording it
+            if result.kind == "exhausted":
+                # Charged for attempts that never reported back. Nothing left to
+                # spend, so nothing is sent and nothing is charged -- it is
+                # simply closed, and says why.
+                deliveries.append(
+                    Delivery(
+                        reminder,
+                        error="gave up without trying: no attempts left",
+                        failure_reason="retries_exhausted",
+                    )
+                )
+                continue
+
+            # Normal case: attempt row exists, budget charged.
+            claim = result.claim
+            attempt_id = result.attempt_id
 
             try:
                 self._destination.send(reminder)

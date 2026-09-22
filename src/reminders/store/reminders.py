@@ -20,7 +20,7 @@ load to find out rather than assume.
 
 No `CHECK` constraint tying `failure_reason` to `state = 'failed'`. The code only
 ever writes them together and the schema would accept a `scheduled` row with a
-reason on it. That is a real hole, named in STAGES.md, with no failure behind it
+reason on it. That is a real hole, named in docs/STAGES.md, with no failure behind it
 yet.
 
 Every worker write carries two numbers
