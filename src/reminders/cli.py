@@ -97,17 +97,24 @@ def _format(reminder: Reminder, attempts: list[Attempt]) -> str:
 
 
 def _state(reminder: Reminder) -> str:
-    """What the user sees, and since Stage 8 there are three of them.
+    """What the user sees. Four words now, and each one was earned by a failure.
 
-    `failed` is the whole point. Until it existed, a reminder nobody could
-    deliver showed the same word as one that had not come due yet -- so the
-    honest summary of the system was "waiting", for three days, about something
-    that was never going to happen.
+    `failed` arrived at Stage 8. Until it existed, a reminder nobody could deliver
+    showed the same word as one that had not come due yet -- so the honest summary
+    of the system was "waiting", for three days, about something that was never
+    going to happen.
+
+    `RUNNING` arrived at Stage 11, when a second worker made "somebody has this"
+    a thing the data had to be able to say.
     """
     if reminder.state == "failed":
         return "FAILED"
     if reminder.state == "delivered":
         return "delivered"
+    if reminder.state == "running":
+        # Nothing yet limits how long a claim may last, so a row sitting here is
+        # also exactly what a worker killed mid-send leaves behind.
+        return "RUNNING"
     return "waiting"
 
 
@@ -266,7 +273,8 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
     print(
-        f"stage 9 - every send is written down before it happens.  store: {where}  poll: {poll}s\n"
+        f"stage 11 - two workers, and only one of them does the job."
+        f"  store: {where}  poll: {poll}s\n"
     )
     print(HELP)
 

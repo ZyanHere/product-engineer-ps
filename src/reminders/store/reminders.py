@@ -211,6 +211,43 @@ class ReminderTable:
             max_attempts=max_attempts,
         )
 
+    def claim(self, reminder_id: int) -> bool:
+        """Take responsibility for a reminder. Returns whether we got it.
+
+        The whole of Stage 11 is in the `AND state = 'scheduled'`. Two workers both
+        run this statement; the first changes one row and the second changes none.
+        Nobody had to coordinate, and no worker had to trust another worker's read.
+
+        **A read cannot exclude anybody** -- that is why discovery could never have
+        solved this. `due()` handing the same row to two workers is fine and
+        unavoidable. What was missing was anything happening between reading and
+        acting.
+
+        Why it must be **one statement**, stated precisely, because the obvious
+        reason is wrong. Eight threads racing a `SELECT state ... then UPDATE`
+        version still produce exactly one winner -- SQLite refuses the second write
+        regardless, so the invariant was never the thing at risk. What the version
+        below buys is *how you lose*: a transaction that read first and then tries
+        to write after somebody else committed cannot be allowed to wait, because
+        waiting cannot make its snapshot valid again, so SQLite fails it at once
+        with `database is locked`. Seven losers become seven exceptions, and in the
+        loop each one aborts a whole poll and takes the reminders behind it down.
+
+        Writing from the start leaves no snapshot to invalidate. The losers match
+        zero rows and get `False`, which is what makes losing *ordinary* -- somebody
+        else is doing the work, which is the correct outcome and costs the loser
+        nothing.
+
+        Nothing is recorded about *who* claimed it or *when*, because nothing yet
+        needs to know. Stage 12 is where "how long has this been claimed?" becomes
+        a question somebody has to answer.
+        """
+        cursor = self._connection.execute(
+            "UPDATE reminder SET state = 'running' WHERE id = ? AND state = 'scheduled'",
+            (reminder_id,),
+        )
+        return cursor.rowcount == 1
+
     def charge_attempt(self, reminder_id: int) -> None:
         """Spend one attempt from the budget. Stage 10.
 
@@ -236,8 +273,24 @@ class ReminderTable:
         self._settle(reminder_id, "state = 'delivered', next_attempt_at = NULL", ())
 
     def defer(self, reminder_id: int, next_attempt_at: datetime) -> None:
-        """Refused, with budget left. Stays `scheduled`, just not yet."""
-        self._settle(reminder_id, "next_attempt_at = ?", (next_attempt_at.isoformat(),))
+        """Refused, with budget left. Back to `scheduled`, just not yet.
+
+        Since Stage 11 this has to say `state = 'scheduled'` out loud, and
+        forgetting it was the one mistake that stage actually made: the row stayed
+        `running`, which `due()` excludes, so every retryable failure quietly
+        became permanent and twenty-nine tests went red at once.
+
+        The claim is released here rather than held across the wait. Holding it
+        would mean one worker owned a reminder for the whole backoff -- up to an
+        hour of doing nothing -- and if that worker died the reminder would be lost
+        until something reclaimed it. A released claim costs a re-claim next time,
+        which is one conditional write.
+        """
+        self._settle(
+            reminder_id,
+            "state = 'scheduled', next_attempt_at = ?",
+            (next_attempt_at.isoformat(),),
+        )
 
     def fail(self, reminder_id: int, reason: FailureReason) -> None:
         """Terminal failure, with the reason recorded.

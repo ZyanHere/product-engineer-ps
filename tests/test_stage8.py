@@ -245,9 +245,12 @@ def test_an_unexpected_exception_is_still_not_a_delivery_failure() -> None:
         reminders.tick(DUE_AT)
 
     row = store.load_all()[0]
-    assert row.state == "scheduled"
     assert row.attempt_count == 1  # Stage 10: the attempt opened, so it was charged
     assert row.failure_reason is None  # but it was not recorded as a delivery failure
+    # Stage 11: the claim was taken and never handed back, because the code that
+    # would have handed it back is the code the exception jumped over. Which is the
+    # same shape as a crash, and has the same consequence until Stage 12.
+    assert row.state == "running"
 
 
 # -- the ordinary path is untouched -----------------------------------------

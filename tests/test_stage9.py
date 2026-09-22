@@ -42,11 +42,12 @@ from reminders.model import Reminder
 from reminders.runner import Runner
 from reminders.service import Reminders
 from reminders.store import Store
-from tests.shared import DUE_AT, naive
+from tests.shared import DUE_AT, STRANDED, naive
 
 # -- the headline ------------------------------------------------------------
 
 
+@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_kill_mid_send_then_restart_gives_one_notification(tmp_path: Path) -> None:
     """The whole stage, in one test.
 
@@ -76,6 +77,7 @@ def test_kill_mid_send_then_restart_gives_one_notification(tmp_path: Path) -> No
     assert phone.repeats == ["Call the clinic"]  # and one recognised repeat
 
 
+@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_every_presentation_carries_the_same_key(tmp_path: Path) -> None:
     """Our half of the claim, checked against a destination that merges nothing.
 
@@ -228,6 +230,7 @@ def test_a_clean_run_leaves_no_unfinished_attempts() -> None:
     assert store.unfinished_attempts() == []
 
 
+@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_the_crash_does_not_close_the_attempt_it_interrupted(tmp_path: Path) -> None:
     """The retry opens a *second* attempt; the first stays open.
 

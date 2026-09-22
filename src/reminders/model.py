@@ -18,12 +18,17 @@ that mattered:
 
 The state machine, as it stands
 ------------------------------
-    scheduled ---> delivered        it went out
-              \\--> failed           nobody is going to deliver it
+    scheduled ---> running ---> delivered      it went out
+                           \\--> failed         nobody is going to deliver it
 
-`scheduled` is the only non-terminal state. It covers both "not due yet" and
-"waiting out a backoff", which is deliberate: a reminder being retried is not a
-special kind of reminder, it is an ordinary owed one whose "not before" moved.
+`scheduled` covers both "not due yet" and "waiting out a backoff", which is
+deliberate: a reminder being retried is not a special kind of reminder, it is an
+ordinary owed one whose "not before" moved.
+
+`running` arrived at Stage 11, when a second worker appeared and "somebody is
+working on this" turned out to have no representation at all. Both non-terminal
+states, and the difference between them is the only thing stopping two workers
+doing the same job.
 
 The rule that holds from Stage 1 onwards
 ----------------------------------------
@@ -49,10 +54,11 @@ __all__ = [
     "State",
 ]
 
-State = Literal["scheduled", "delivered", "failed"]
+State = Literal["scheduled", "running", "delivered", "failed"]
 """Where a reminder is.
 
-    scheduled   owed, or waiting out a backoff. The only non-terminal one.
+    scheduled   owed, or waiting out a backoff. Available to be picked up.
+    running     a worker has taken responsibility for it. Stage 11.
     delivered   it went out
     failed      it is not going out, and the row says why
 
@@ -60,6 +66,16 @@ Was a boolean until Stage 8. A boolean could hold "it worked" and "not yet",
 which forced the third case -- *nobody is ever going to deliver this* -- to hide
 inside "not yet". That is how a permanently invalid recipient spent three days
 looking like it was still coming.
+
+`running` was added at Stage 11 for the same kind of reason. Two workers polling
+one database both found the same reminder and both executed it, because finding
+work and doing work had never been separated -- every worker that could *see* a
+reminder considered itself entitled to *act* on it. There was no way for the data
+to say "taken".
+
+**Nothing says how long a `running` reminder may stay that way**, which is the
+next thing to break: a worker killed while holding one leaves a row nobody will
+ever pick up again.
 """
 
 AttemptOutcome = Literal["delivered", "refused", "rejected"]

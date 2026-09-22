@@ -126,6 +126,17 @@ class Store:
         """Reminders that are owed and still open. See `reminders.due`."""
         return self._reminders.due(now)
 
+    def claim(self, reminder_id: int) -> bool:
+        """Move a reminder from `scheduled` to `running`, if it is still going.
+
+        One conditional write, committed immediately, and the return value is the
+        only thing a worker needs: *did I get it?* Two workers both ask, the
+        database serialises them, one gets True and one gets False.
+        """
+        with self._transaction():
+            won = self._reminders.claim(reminder_id)
+        return won
+
     def insert(
         self,
         local_datetime: datetime,

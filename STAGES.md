@@ -1174,13 +1174,28 @@ advance past its time
 
 ### What happens
 
-Both find it. Both send it.
+Both find it. Both send it. *Measured* — two `Store` objects on one file, which is what two processes have:
 
-The destination collapses them, so **the user still gets one message** — Stage 9 already handled the effect. So what is actually wrong?
+```
+A's poll returns 1 reminder(s)
+B's poll returns 1 reminder(s)   <- the same one
 
-Two things. Wasted work, which is merely annoying. And something worse: **two attempt records, two writers of the same row, and nothing deciding which one is in charge.**
+presented to the destination: 2 times  ['sent by A', 'sent by B']
+attempt rows:                 2  ['delivered', 'refused']
+budget:                       2/5  (for one reminder)
+state:                        delivered
+next_attempt_at:              2026-03-09 13:05:00+00:00
+```
 
-Today they write the same thing, so it looks fine. It stops looking fine the moment their writes differ — one recording success while the other records a failure and schedules a retry.
+A deduplicating destination collapses the two sends, so **the user still gets one message** — Stage 9 already handled the effect. So what is actually wrong?
+
+Wasted work, which is merely annoying. Two of five attempts spent on one reminder, so the budget now drains at a rate set by the size of the fleet. And then read the last two lines together: **`delivered`, with a retry booked for five minutes' time.** A delivered it and said so; B recorded a failure and scheduled another go; B wrote last, so B won. The row asserts two things that cannot both be true.
+
+That is the real damage, and it only appeared because the two workers got *different answers*. With both succeeding it looks fine, which is exactly why this is the kind of bug that ships.
+
+### How the break had to be written
+
+The first version ran `a.tick()` then `b.tick()` and showed **nothing at all** — B's tick re-read the store, found the row already settled, and did nothing. **Sequential calls do not race.** The race is *inside* a tick, between reading and acting, so the interleaving has to be written out step by step in the order two overlapping ticks produce. Deterministic on purpose: a demonstration, not a coin flip.
 
 ### Why
 
@@ -1203,7 +1218,9 @@ And a worker holding a reminder is a new situation the data model has no word fo
   - **11.2.1** the result is *"did I get it?"* — one row changed, or none
   - **11.2.2** the discovery query already excludes `running`, so a claimed reminder disappears from everyone else's view
 - **11.3** losing a claim costs nothing: no rollback, no backoff, carry on to the next candidate
-- **11.4** on finishing, move out of `running`
+- **11.4** on finishing, move out of `running` — **including a retryable failure**
+  - **11.4.1** this is the one mistake the stage actually made. `defer()` recorded the backoff and forgot `state = 'scheduled'`, so the row stayed `running`, `due()` excludes `running`, and every retryable failure silently became permanent. Twenty-nine tests went red at once, which is the good version of that mistake
+  - **11.4.2** the claim is **released** rather than held across the wait. Holding it would mean one worker owned a reminder for up to an hour of doing nothing, and losing that worker would lose the reminder with it. A released claim costs one conditional write to re-take
 
 ### State
 
@@ -1218,13 +1235,35 @@ And a worker holding a reminder is a new situation the data model has no word fo
 ### Tests
 
 - two workers, one reminder, **one** claim succeeds and one changes nothing
-- one send, not two
+- one send, not two — asserted against a destination that merges nothing, because a deduplicating one would do our job for us
 - a claimed reminder is invisible to the discovery query
 - a worker that loses a claim carries on to the next item without error
+- one reminder costs one attempt however many workers looked at it
+- the row cannot end up saying two things, which is what the break actually produced
+- **eight threads racing one claim** — the only test here with real concurrency, and it had to be added because a mutation survived
+
+### Two things mutation testing found that review would not have
+
+**The "loser carries on" test was not testing that at all.** It had worker A claim the middle of three reminders and then let B tick. But a claimed reminder is *invisible* to `due()`, so B never saw it, never lost anything, and changing the loser's `continue` to `break` failed no test. Losing a claim requires the loser to have **already read** the row before it was taken — the actual race — so B's poll is now frozen to a snapshot taken before A acted.
+
+**The reason the claim must be one statement is not the reason you would give.** Every other test here interleaves *between* store calls, which cannot distinguish a single conditional write from a `SELECT state ... then UPDATE`. So eight threads were put on a barrier, and the result was more interesting than expected:
+
+```
+['database is locked' x7, True]      read-then-write
+[True, False x7]                     one conditional write
+```
+
+**The read-then-write version still produces exactly one winner.** SQLite refuses the second write either way, so the invariant was never the thing at risk. What the predicate buys is *how you lose*: a transaction that read first and then tries to write after somebody else committed cannot be allowed to wait — waiting cannot make its snapshot valid again — so it fails immediately with `database is locked`. Seven losers become seven exceptions, and in the loop each one aborts a whole poll and takes every reminder behind it down.
+
+Writing from the start leaves no snapshot to invalidate: the losers match zero rows and get `False`. **Losing becomes ordinary**, which is what 11.3 actually requires. The docstring that said "SQLite serialises them, so one wins" was true and was not the point.
 
 ### Still broken
 
-Nothing says how long a claim lasts.
+Nothing says how long a claim lasts, and that is not a loose end — **it is a straight regression in a capability Stages 9 and 10 had.** A worker killed mid-send leaves its reminder in `running`, where `due()` cannot see it, by anybody, forever. Stage 11 traded a duplicate for a disappearance.
+
+Eight tests across Stages 9 and 10 state the recovery behaviour that has been lost. They are marked `xfail(strict=True)` rather than rewritten, and the strictness is the whole point: a strict xfail that starts passing is reported as a **failure**, so the moment Stage 12 restores recovery every one of them goes red and has to be un-marked. Rewriting their assertions to match the broken behaviour would have quietly lowered the bar and left nothing to notice when it could be raised again.
+
+`test_stage11.py::test_a_crashed_worker_strands_its_reminder` is the positive half of the same record — the one test in the suite that asserts broken behaviour on purpose.
 
 ### Next question
 

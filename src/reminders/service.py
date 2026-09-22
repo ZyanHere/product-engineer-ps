@@ -135,7 +135,17 @@ class Reminders:
         The store is asked afresh, so a reminder created a moment ago by some
         other program is picked up here.
 
-        Three steps per reminder, and the order is the whole of Stage 9:
+        **Discovering is not claiming.** Since Stage 11 seeing a reminder entitles
+        a worker to nothing; it has to take it first, and the attempt to take it is
+        a conditional write that exactly one worker wins. Two loops polling one
+        database both get the same row back from `due()` -- a read cannot exclude
+        anybody, and it never could. What was missing was anything happening
+        between reading and acting.
+
+        Losing a claim is not a failure and is not retried. Somebody else is doing
+        the work; move on to the next candidate.
+
+        Then three steps per reminder, and the order is the whole of Stage 9:
 
             commit    open an attempt, with no outcome
             send      outside our world, no transaction open
@@ -173,6 +183,9 @@ class Reminders:
         deliveries: list[Delivery] = []
 
         for reminder in self._store.due(now):
+            if not self._store.claim(reminder.id):
+                continue  # somebody else has it. Nothing to do, nothing to undo.
+
             if reminder.attempts_left() == 0:
                 # Charged for attempts that never reported back. Nothing left to
                 # spend, so nothing is sent and nothing is charged -- it is simply
