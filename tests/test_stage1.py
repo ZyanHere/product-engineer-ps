@@ -16,7 +16,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from reminders.core import Reminders
+from reminders.delivery import NullDestination
 from reminders.store import Store
+
+# These stages are about *when* a reminder is owed, not where it goes.
+SUCCEEDS = NullDestination()
+
 
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
 
@@ -32,7 +37,7 @@ def naive(instant: datetime) -> datetime:
 
 
 def test_does_not_fire_before_its_time() -> None:
-    reminders = Reminders(Store.open())
+    reminders = Reminders(Store.open(), SUCCEEDS)
     reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     assert reminders.tick(DUE_AT - timedelta(minutes=1)) == []
@@ -47,12 +52,12 @@ def test_fires_at_its_time() -> None:
     mutating it would mean nothing. Asking the store is the only honest check.
     """
     store = Store.open()
-    reminders = Reminders(store)
+    reminders = Reminders(store, SUCCEEDS)
     created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     fired = reminders.tick(DUE_AT)
 
-    assert [r.id for r in fired] == [created.id]
+    assert [d.reminder.id for d in fired] == [created.id]
     assert [r.done for r in store.load_all()] == [True]
 
 
@@ -62,7 +67,7 @@ def test_fires_exactly_once() -> None:
     Without this, every tick after the due time would fire the reminder again:
     a busy loop that looks like healthy operation.
     """
-    reminders = Reminders(Store.open())
+    reminders = Reminders(Store.open(), SUCCEEDS)
     reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     assert len(reminders.tick(DUE_AT)) == 1
@@ -76,18 +81,18 @@ def test_an_overdue_reminder_still_fires() -> None:
     somebody happened to look. This costs one character and it is the reason
     Stage 4's problem is about a query window rather than about this.
     """
-    reminders = Reminders(Store.open())
+    reminders = Reminders(Store.open(), SUCCEEDS)
     reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
     assert len(reminders.tick(DUE_AT + timedelta(hours=6))) == 1
 
 
 def test_fires_in_due_order() -> None:
-    reminders = Reminders(Store.open())
+    reminders = Reminders(Store.open(), SUCCEEDS)
     reminders.create(naive(DUE_AT + timedelta(hours=2)), "UTC", "third")
     reminders.create(naive(DUE_AT), "UTC", "first")
     reminders.create(naive(DUE_AT + timedelta(hours=1)), "UTC", "second")
 
     fired = reminders.tick(DUE_AT + timedelta(hours=3))
 
-    assert sorted(r.text for r in fired) == ["first", "second", "third"]
+    assert sorted(d.reminder.text for d in fired) == ["first", "second", "third"]

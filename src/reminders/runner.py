@@ -33,6 +33,13 @@ whenever anybody next asks.
 (That happy state does not last. By Stage 13 a timing parameter turns out to be
 able to change *which terminal state* a reminder reaches, which is a different
 kind of problem entirely.)
+
+Stage 7 note
+------------
+The poll interval is now also the **floor** on a retry gap: a backoff of five
+seconds under a sixty-second poll is a sixty-second wait. That is a rounding
+error in favour of waiting longer, which is the safe direction -- it can only
+ever hit the destination less often than asked, never more.
 """
 
 from __future__ import annotations
@@ -40,7 +47,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from reminders.core import Reminder
+from reminders.core import Delivery
 
 if TYPE_CHECKING:
     from reminders.clock import Clock
@@ -69,21 +76,27 @@ class Runner:
         self._clock = clock
         self._poll_seconds = poll_seconds
 
-    def run_until(self, horizon: datetime) -> list[Reminder]:
-        """Run the loop until the clock reaches `horizon`. Returns what fired.
+    def run_until(self, horizon: datetime) -> list[Delivery]:
+        """Run the loop until the clock reaches `horizon`. Returns every attempt.
 
         Asking *before* the first nap matters: anything already owed goes out
         immediately rather than waiting a full interval for its turn.
+
+        Since Stage 7 the list holds every *attempt*, not every success -- a
+        reminder whose destination refused three times before working appears
+        four times. That is the point: the failures are how you see the backoff
+        working, and counting the entries is how a test proves the destination
+        stopped being hammered.
 
         Against a `FakeClock` this returns as fast as the loop body executes,
         because the nap is what moves the clock. Against a real one it blocks
         for real, which is what a service does.
         """
-        fired: list[Reminder] = []
+        attempts: list[Delivery] = []
         while self._clock.now() < horizon:
-            fired.extend(self._reminders.tick(self._clock.now()))
+            attempts.extend(self._reminders.tick(self._clock.now()))
             self._clock.sleep(self._poll_seconds)
-        return fired
+        return attempts
 
     def run_forever(self) -> None:  # pragma: no cover - blocks by design
         """Run until the process is stopped. What a deployed service does.

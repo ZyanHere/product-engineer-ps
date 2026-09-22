@@ -601,11 +601,41 @@ Replace the destination with one that refuses, then watch for a minute.
 
 ### What happens
 
-Two things, and only one is obvious.
+*Corrected after building it.* The predicted failure was hammering. The first
+thing the experiment actually produced was worse, and the hammering only showed
+up behind it.
 
-The obvious one: with a one-second poll, the destination is hit **sixty times a minute**. When it recovers, the reminder is delivered — so the system "works", in the sense that a self-healing infinite retry loop works.
+```
+send failed: connection refused
+destination hit 1 time(s) in that minute
+row: done=True
+```
 
-The non-obvious one: **there is no trace of any of it.** No error recorded, no count, no timestamp. If the destination never recovers, the reminder sits in `not done` forever and nothing in the database explains why.
+**One hit, and the row says delivered.** Because delivery was never inside the
+system: `tick` marked the row and handed the object back, and whether anything
+reached a human happened somewhere else entirely. So `done` did not mean
+*delivered*, it meant *we got as far as returning it* — and a down destination
+produced a silently discarded reminder with a successful-looking record behind
+it.
+
+Move delivery inside, so `done` depends on the outcome, and the predicted
+failure appears:
+
+```
+destination hit 30 times in one minute
+row: done=False
+what the database can say about why it has not arrived: nothing
+```
+
+Now two things, and only one is obvious.
+
+The obvious one: the destination is hit **once per poll, forever**. When it
+recovers, the reminder is delivered — so the system "works", in the sense that
+a self-healing infinite retry loop works.
+
+The non-obvious one: **there is no trace of any of it.** No error recorded, no
+count, no timestamp. If the destination never recovers, the reminder sits in
+`not done` forever and nothing in the database explains why.
 
 ### Why
 
@@ -624,10 +654,12 @@ And the delay has to come from the database, not a timer. A timer lives in the p
 
 ### Build
 
+- **7.0** delivery becomes something the system does, rather than something the caller does afterwards — the step the plan had missed, and the one the other two depend on
 - **7.1** the destination can fail: outcome becomes success-or-failure rather than nothing
 - **7.2** record the last failure on the row: what went wrong, and when
 - **7.3** back off: on failure, set the next time to try
-  - **7.3.1** the reminder is simply **not due** until then — which the existing `due_at <= now` query already handles. No new state, no new query, no new index
+  - **7.3.1** the reminder is simply **not due** until then. *As built:* the query grew one `COALESCE`, not a retry queue — `COALESCE(next_attempt_at, due_at) <= now`. What the plan meant, and what held: **no new state, no `retrying`, no second query, no scheduler.** A reminder waiting out a backoff is an ordinary owed one whose "not before" moved, which is why Stage 3's restart recovery keeps working without being told retries exist
+  - **7.3.2b** `due_at` is **never rewritten**. Overwriting it would have made the backoff free — one column instead of two — and erased how late the delivery actually was, which is the one number anybody asks about afterwards
   - **7.3.2** the delay is computed from stored values, never from an in-process timer
 
 ### Persistence
@@ -648,6 +680,15 @@ And the delay has to come from the database, not a timer. A timer lives in the p
 ### Still broken
 
 The retry has no end.
+
+Two more, found while building rather than planned. **An unexpected exception
+takes down the whole poll** — only `DeliveryError` is treated as a refusal, so a
+bug in our own code escapes loudly instead of being retried for a week, and
+reminders behind it wait for a restart. That is the right trade at this size and
+Stage 12's problem later. And **there is no jitter**: a crowd of reminders that
+failed together will march back in lockstep. Nothing here has ever had a crowd,
+so there is no failure to fix yet — Stage 17 is where the lockstep becomes
+visible.
 
 ### Next question
 

@@ -13,8 +13,12 @@ from pathlib import Path
 import pytest
 
 from reminders.core import Reminders
+from reminders.delivery import NullDestination
 from reminders.store import Store
 from reminders.timezones import UnknownTimeZoneError, resolve
+
+# These stages are about *when* a reminder is owed, not where it goes.
+SUCCEEDS = NullDestination()
 
 NINE_AM = datetime(2026, 3, 9, 9, 0)  # naive: what somebody actually said
 
@@ -95,10 +99,10 @@ def test_both_the_question_and_the_answer_survive(tmp_path: Path) -> None:
     """
     store = Store.open(tmp_path / "r.db")
     try:
-        Reminders(store).create(NINE_AM, "America/New_York", "Call the clinic")
+        Reminders(store, SUCCEEDS).create(NINE_AM, "America/New_York", "Call the clinic")
 
         # Fresh program, same file.
-        reloaded = Reminders(store).all()[0]
+        reloaded = Reminders(store, SUCCEEDS).all()[0]
         assert reloaded.local_datetime == NINE_AM
         assert reloaded.local_datetime.tzinfo is None, "the intent stays naive"
         assert reloaded.iana_zone == "America/New_York"
@@ -111,15 +115,15 @@ def test_two_zones_one_wall_time_fire_at_different_moments(tmp_path: Path) -> No
     """The whole point, end to end."""
     store = Store.open(tmp_path / "r.db")
     try:
-        reminders = Reminders(store)
+        reminders = Reminders(store, SUCCEEDS)
         reminders.create(NINE_AM, "Asia/Kolkata", "Standup")
         reminders.create(NINE_AM, "America/New_York", "Call the clinic")
 
         at_kolkata_nine = reminders.tick(datetime(2026, 3, 9, 3, 30, tzinfo=UTC))
-        assert [r.text for r in at_kolkata_nine] == ["Standup"]
+        assert [d.reminder.text for d in at_kolkata_nine] == ["Standup"]
 
         at_new_york_nine = reminders.tick(datetime(2026, 3, 9, 13, 0, tzinfo=UTC))
-        assert [r.text for r in at_new_york_nine] == ["Call the clinic"]
+        assert [d.reminder.text for d in at_new_york_nine] == ["Call the clinic"]
     finally:
         store.close()
 
@@ -133,8 +137,8 @@ def test_a_bad_zone_writes_nothing(tmp_path: Path) -> None:
     store = Store.open(tmp_path / "r.db")
     try:
         with pytest.raises(UnknownTimeZoneError):
-            Reminders(store).create(NINE_AM, "Nowhere/Nothing", "Call the clinic")
-        assert Reminders(store).all() == []
+            Reminders(store, SUCCEEDS).create(NINE_AM, "Nowhere/Nothing", "Call the clinic")
+        assert Reminders(store, SUCCEEDS).all() == []
     finally:
         store.close()
 

@@ -16,8 +16,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from reminders.core import Reminders
+from reminders.delivery import NullDestination
 from reminders.store import Store
 from reminders.timezones import resolve
+
+# These stages are about *when* a reminder is owed, not where it goes.
+SUCCEEDS = NullDestination()
 
 NY = "America/New_York"
 
@@ -144,11 +148,11 @@ def test_the_classification_is_stored_and_survives(tmp_path: Path) -> None:
     """
     store = Store.open(tmp_path / "r.db")
     try:
-        Reminders(store).create(GAP, NY, "Call the clinic")
-        Reminders(store).create(OVERLAP, NY, "Book the dentist")
-        Reminders(store).create(datetime(2026, 3, 9, 9, 0), NY, "Standup")
+        Reminders(store, SUCCEEDS).create(GAP, NY, "Call the clinic")
+        Reminders(store, SUCCEEDS).create(OVERLAP, NY, "Book the dentist")
+        Reminders(store, SUCCEEDS).create(datetime(2026, 3, 9, 9, 0), NY, "Standup")
 
-        stored = {r.text: r.resolution_class for r in Reminders(store).all()}
+        stored = {r.text: r.resolution_class for r in Reminders(store, SUCCEEDS).all()}
         assert stored == {
             "Call the clinic": "gap_shifted",
             "Book the dentist": "overlap_first",
@@ -162,7 +166,7 @@ def test_a_shifted_reminder_still_fires_at_its_shifted_time(tmp_path: Path) -> N
     """End to end: the adjustment is real, not just recorded."""
     store = Store.open(tmp_path / "r.db")
     try:
-        reminders = Reminders(store)
+        reminders = Reminders(store, SUCCEEDS)
         reminders.create(GAP, NY, "Call the clinic")
 
         # 07:29Z is 02:29 local... which does not exist. Nothing is owed yet.

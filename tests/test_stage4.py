@@ -18,8 +18,13 @@ import pytest
 
 from reminders.clock import FakeClock, SystemClock
 from reminders.core import Reminders
+from reminders.delivery import NullDestination
 from reminders.runner import Runner
 from reminders.store import Store
+
+# These stages are about *when* a reminder is owed, not where it goes.
+SUCCEEDS = NullDestination()
+
 
 START = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
 DUE_AT = datetime(2026, 3, 9, 13, 0, tzinfo=UTC)
@@ -37,7 +42,7 @@ def naive(instant: datetime) -> datetime:
 
 def _wired(tmp_path: Path, poll: float = 60.0) -> tuple[Reminders, FakeClock, Runner, Store]:
     store = Store.open(tmp_path / "r.db")
-    reminders = Reminders(store)
+    reminders = Reminders(store, SUCCEEDS)
     clock = FakeClock(START)
     return reminders, clock, Runner(reminders, clock, poll_seconds=poll), store
 
@@ -82,7 +87,7 @@ def test_it_fires_with_nobody_asking(tmp_path: Path) -> None:
 
         fired = runner.run_until(DUE_AT + timedelta(hours=1))
 
-        assert [r.text for r in fired] == ["Call the clinic"]
+        assert [d.reminder.text for d in fired] == ["Call the clinic"]
         assert clock.now() >= DUE_AT
     finally:
         store.close()
@@ -106,7 +111,7 @@ def test_anything_already_owed_goes_out_immediately(tmp_path: Path) -> None:
     """
     store = Store.open(tmp_path / "r.db")
     try:
-        reminders = Reminders(store)
+        reminders = Reminders(store, SUCCEEDS)
         reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         # The clock starts *after* the due time, and the horizon is one nap away.
@@ -147,7 +152,7 @@ def test_six_months_of_polling_costs_no_real_time(tmp_path: Path) -> None:
 
         fired = runner.run_until(far_off + timedelta(hours=1))
 
-        assert [r.text for r in fired] == ["Book the dentist"]
+        assert [d.reminder.text for d in fired] == ["Book the dentist"]
         assert clock.now() > far_off
     finally:
         store.close()
@@ -162,7 +167,7 @@ def test_the_loop_holds_no_schedule(tmp_path: Path) -> None:
     """
     store = Store.open(tmp_path / "r.db")
     try:
-        reminders = Reminders(store)
+        reminders = Reminders(store, SUCCEEDS)
         reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
 
         # First loop stops an hour short.
@@ -174,7 +179,7 @@ def test_the_loop_holds_no_schedule(tmp_path: Path) -> None:
         fired = Runner(reminders, second, poll_seconds=60.0).run_until(
             DUE_AT + timedelta(minutes=5)
         )
-        assert [r.text for r in fired] == ["Call the clinic"]
+        assert [d.reminder.text for d in fired] == ["Call the clinic"]
     finally:
         store.close()
 
