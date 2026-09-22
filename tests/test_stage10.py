@@ -24,11 +24,12 @@ of the stage.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from reminders.claims import CLAIM_DURATION
 from reminders.clock import FakeClock
 from reminders.delivery import (
     CrashAfterSendDestination,
@@ -42,7 +43,13 @@ from reminders.model import Reminder
 from reminders.runner import Runner
 from reminders.service import Reminders
 from reminders.store import Store
-from tests.shared import DUE_AT, STRANDED, naive
+from tests.shared import DUE_AT, naive
+
+# A reminder nobody has claimed has `claim_seq = 0`, and Stage 13 requires every
+# worker write to carry the current one. Tests that drive the store directly,
+# without a claim, pass 0 for it. A real worker can never hold 0: `claim()` bumps
+# the counter before handing it back, so the first token it can ever return is 1.
+UNCLAIMED = 0
 
 
 def _crash_loop(path: Path, times: int, budget: int = 3) -> tuple[LedgerDestination, Reminder]:
@@ -50,6 +57,11 @@ def _crash_loop(path: Path, times: int, budget: int = 3) -> tuple[LedgerDestinat
 
     Each iteration opens its own `Store`, which is what a restart is. The ledger
     outlives them all, because the outside world does.
+
+    *Since Stage 12* each restart also has to wait out the claim the dead worker
+    left behind, so the loop steps forward by one claim window per crash. That is
+    the cost of recovery, and `recovered_at()` is where the later assertions get
+    the instant it all finished.
     """
     phone = LedgerDestination()
 
@@ -59,21 +71,27 @@ def _crash_loop(path: Path, times: int, budget: int = 3) -> tuple[LedgerDestinat
     )
     store.close()
 
-    for _ in range(times):
+    for crash in range(times):
         store = Store.open(path)
         try:
             with pytest.raises(SimulatedCrash):
-                Reminders(store, CrashAfterSendDestination(phone)).tick(DUE_AT)
+                Reminders(store, CrashAfterSendDestination(phone)).tick(
+                    DUE_AT + crash * CLAIM_DURATION
+                )
         finally:
             store.close()
 
     return phone, created
 
 
+def recovered_at(crashes: int) -> datetime:
+    """When the next worker may take over, after `crashes` crashes."""
+    return DUE_AT + crashes * CLAIM_DURATION
+
+
 # -- the headline ------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_crashing_mid_send_three_times_ends_in_failed_not_a_loop(tmp_path: Path) -> None:
     """The whole stage. A budget of 3, three crashes, and then it is over.
 
@@ -86,8 +104,9 @@ def test_crashing_mid_send_three_times_ends_in_failed_not_a_loop(tmp_path: Path)
 
     store = Store.open(path)
     try:
-        # A fourth poll, with the destination healthy this time.
-        Reminders(store, phone).tick(DUE_AT)
+        # A fourth poll, with the destination healthy this time -- once the third
+        # worker's claim has run out.
+        Reminders(store, phone).tick(recovered_at(3))
         row = store.load_all()[0]
     finally:
         store.close()
@@ -98,7 +117,6 @@ def test_crashing_mid_send_three_times_ends_in_failed_not_a_loop(tmp_path: Path)
     assert row.attempt_count == 3
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_the_budget_is_spent_by_crashes_alone(tmp_path: Path) -> None:
     """Each crash costs one, so three crashes leave nothing."""
     path = tmp_path / "r.db"
@@ -112,10 +130,10 @@ def test_the_budget_is_spent_by_crashes_alone(tmp_path: Path) -> None:
 
     assert row.attempt_count == 3
     assert row.attempts_left() == 0
-    assert row.state == "scheduled"  # not yet closed: no write got that far
+    # Still held by the worker that died holding it -- until its claim expires.
+    assert row.state == "running"
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_a_reminder_out_of_budget_is_closed_without_being_sent(tmp_path: Path) -> None:
     """The state Stage 10 makes possible, and has to handle.
 
@@ -130,7 +148,7 @@ def test_a_reminder_out_of_budget_is_closed_without_being_sent(tmp_path: Path) -
 
     store = Store.open(path)
     try:
-        [delivery] = Reminders(store, phone).tick(DUE_AT)
+        [delivery] = Reminders(store, phone).tick(recovered_at(3))
         row = store.load_all()[0]
         history = store.attempts(row.id)
     finally:
@@ -145,7 +163,6 @@ def test_a_reminder_out_of_budget_is_closed_without_being_sent(tmp_path: Path) -
     assert row.attempt_count == 3
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_it_stays_closed(tmp_path: Path) -> None:
     """Terminal means terminal. A later poll does not find it again."""
     path = tmp_path / "r.db"
@@ -153,7 +170,7 @@ def test_it_stays_closed(tmp_path: Path) -> None:
 
     store = Store.open(path)
     try:
-        Reminders(store, phone).tick(DUE_AT)
+        Reminders(store, phone).tick(recovered_at(3))
         assert store.due(DUE_AT + timedelta(days=365)) == []
     finally:
         store.close()
@@ -191,7 +208,6 @@ def test_a_crash_before_the_send_leaves_still_burns_an_attempt() -> None:
     assert store.attempts(created.id)[0].unfinished
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_over_counting_is_the_safe_direction() -> None:
     """The claim behind that trade, made checkable.
 
@@ -206,12 +222,12 @@ def test_over_counting_is_the_safe_direction() -> None:
     reminders = Reminders(store, CrashAfterSendDestination(phone, crash_on={1, 2}))
     reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=3)
 
-    for _ in range(2):
+    for crash in range(2):
         with pytest.raises(SimulatedCrash):
-            reminders.tick(DUE_AT)
+            reminders.tick(recovered_at(crash))
 
     # Third send does not crash, and the two crashes are already paid for.
-    [delivery] = reminders.tick(DUE_AT)
+    [delivery] = reminders.tick(recovered_at(2))
 
     assert delivery.delivered
     assert store.load_all()[0].attempt_count == 3
@@ -288,7 +304,7 @@ def test_the_charge_and_the_attempt_row_are_one_transaction() -> None:
 
     statements: list[str] = []
     store.trace(statements.append)
-    store.open_attempt(1, DUE_AT)
+    store.open_attempt(1, DUE_AT, UNCLAIMED)
     store.trace(None)
 
     assert statements[0] == "BEGIN"

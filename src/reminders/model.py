@@ -19,7 +19,12 @@ that mattered:
 The state machine, as it stands
 ------------------------------
     scheduled ---> running ---> delivered      it went out
-                           \\--> failed         nobody is going to deliver it
+        ^              |    \\--> failed         nobody will deliver it
+        |              |
+        \\--------------/   a retryable failure hands the claim back
+
+    running -----> running                     a claim expired and somebody
+                                               else took the work over
 
 `scheduled` covers both "not due yet" and "waiting out a backoff", which is
 deliberate: a reminder being retried is not a special kind of reminder, it is an
@@ -29,6 +34,11 @@ ordinary owed one whose "not before" moved.
 working on this" turned out to have no representation at all. Both non-terminal
 states, and the difference between them is the only thing stopping two workers
 doing the same job.
+
+A takeover adds **no new state**: it is `running` -> `running`. Ownership
+changed; the reminder's own situation did not. Worth noticing, because it is the
+first hint that *who owns this* and *what state is this in* are two different
+questions -- and Stage 13 is where treating them as one stops working.
 
 The rule that holds from Stage 1 onwards
 ----------------------------------------
@@ -78,17 +88,23 @@ next thing to break: a worker killed while holding one leaves a row nobody will
 ever pick up again.
 """
 
-AttemptOutcome = Literal["delivered", "refused", "rejected"]
+AttemptOutcome = Literal["delivered", "refused", "rejected", "unknown"]
 """How one attempt ended.
 
     delivered   the destination accepted it
     refused     it said no, and might not next time
     rejected    it said no, permanently
+    unknown     nobody ever found out. Stage 12.
 
-**`None` is the fourth and most important value**, and it is not in this list
-because it is not an ending. An attempt whose outcome is NULL means *a send may
-have occurred and we never found out*. Nothing else in the system can express
-that.
+`None` means an attempt with **no ending yet** -- open right now, or abandoned by
+a process that died. From inside the database those are the same row, which is
+why `unknown` had to be invented rather than inferred.
+
+`unknown` is what a takeover writes onto the record its predecessor left open.
+Not success, because we do not know that. Not failure, because we do not know
+that either. **It is permanent and is never revised**: we will never learn which
+of the three worlds that attempt was in, and a record that later claimed
+otherwise would be inventing knowledge.
 """
 
 FailureReason = Literal["retries_exhausted", "permanent_error"]
@@ -162,6 +178,43 @@ class Reminder:
 
     next_attempt_at: datetime | None = None
     """Not before this instant. `None` means no failure is being waited out."""
+
+    claimed_until: datetime | None = None
+    """How long the current holder's claim is honoured for. Stage 12.
+
+    An **instant**, not a duration, and wall-clock rather than elapsed. A duration
+    only means something to a process that knows when the claim started; the whole
+    point is that a *different* process reads this row later.
+
+    It does not mean the holder is alive until then. It means nobody else will
+    take the work before then -- see `claims.py`.
+    """
+
+    claimed_by: str | None = None
+    """Which worker holds it. Observability, not correctness -- see
+    `claims.new_worker_id`."""
+
+    claim_seq: int = 0
+    """How many times this reminder has been claimed. Stage 13.
+
+    A **fencing token**: a number that only ever goes up, handed to whoever wins a
+    claim, and carried by every write that worker subsequently makes. A write
+    whose number is no longer the current one matches nothing.
+
+    Stage 12 gave claims an expiry and was careful to say that an expired claim
+    does not mean the holder is dead. It meant it -- and then did nothing about
+    the case where the holder was merely slow. A worker replaced mid-send was
+    never told, had no way to find out, and finished the job it believed it still
+    owned, overwriting the row and the history behind it.
+
+    This is how it finds out: by writing, and being told nothing changed. No
+    notification, no heartbeat, no consensus.
+
+    The point worth keeping: **the question we could never answer stops
+    mattering.** We never needed to know whether that worker was dead or slow. We
+    needed its writes to be ignored once it had been replaced, which is a
+    different question and an answerable one.
+    """
 
     attempt_count: int = 0
     """How many times delivery has been attempted. Successes included.

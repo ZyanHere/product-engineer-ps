@@ -44,9 +44,10 @@ happened*, which it previously could not.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from reminders.claims import CLAIM_DURATION
 from reminders.clock import Clock, FakeClock, SystemClock
 from reminders.delivery import (
     CrashAfterSendDestination,
@@ -112,8 +113,6 @@ def _state(reminder: Reminder) -> str:
     if reminder.state == "delivered":
         return "delivered"
     if reminder.state == "running":
-        # Nothing yet limits how long a claim may last, so a row sitting here is
-        # also exactly what a worker killed mid-send leaves behind.
         return "RUNNING"
     return "waiting"
 
@@ -134,10 +133,17 @@ def _trouble(reminder: Reminder, attempts: list[Attempt]) -> str | None:
     # attempt opens, so a crash that reported nothing still shows up here.
     tries = f"[{reminder.attempt_count}/{reminder.max_attempts} used]"
 
+    held = ""
+    if reminder.claimed_by is not None and reminder.claimed_until is not None:
+        held = (
+            f"\n       held by {reminder.claimed_by} (claim #{reminder.claim_seq}) "
+            f"until {reminder.claimed_until.isoformat()}"
+        )
+
     if last.unfinished:
         return (
             f"       !! attempt {last.id} started {last.started_at.isoformat()} and "
-            f"never finished - a send MAY have happened  {tries}"
+            f"never finished - a send MAY have happened  {tries}{held}"
         )
 
     if last.error is None:
@@ -149,7 +155,7 @@ def _trouble(reminder: Reminder, attempts: list[Attempt]) -> str | None:
         ending = f"; next try {reminder.next_attempt_at.isoformat()}"
     else:
         ending = ""
-    return f"       last error: {last.error} at {last.started_at.isoformat()} {tries}{ending}"
+    return f"       last error: {last.error} at {last.started_at.isoformat()} {tries}{ending}{held}"
 
 
 def _format_attempt(attempt: Attempt) -> str:
@@ -158,6 +164,14 @@ def _format_attempt(attempt: Attempt) -> str:
         return (
             f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  "
             "UNFINISHED - a send may have happened"
+        )
+    if attempt.outcome == "unknown":
+        # The takeover's honest answer, and it is never revised.
+        return (
+            f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  "
+            f"unknown - abandoned, taken over at {attempt.finished_at.isoformat()}"
+            if attempt.finished_at
+            else f"    {attempt.id:>4}  unknown"
         )
     detail = f"  {attempt.error}" if attempt.error else ""
     return f"    {attempt.id:>4}  {attempt.started_at.isoformat()}  {attempt.outcome}{detail}"
@@ -223,6 +237,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--real", action="store_true", help="use the wall clock and nap for real")
     parser.add_argument("--poll", type=float, default=DEFAULT_POLL_SECONDS)
     parser.add_argument(
+        "--worker",
+        default=None,
+        help="this worker's name, for the claim record (default: a fresh one)",
+    )
+    parser.add_argument(
+        "--claim-seconds",
+        type=float,
+        default=CLAIM_DURATION.total_seconds(),
+        help="how long a claim is honoured before anybody else may take the work",
+    )
+    parser.add_argument(
         "--destination",
         default="print",
         help=(
@@ -236,7 +261,13 @@ def main(argv: list[str] | None = None) -> int:
     destination = _destination(str(args.destination))
     store = Store.open(args.db)
     try:
-        return _prompt(Reminders(store, destination), clock, float(args.poll), str(args.db))
+        reminders = Reminders(
+            store,
+            destination,
+            worker=args.worker,
+            claim_for=timedelta(seconds=float(args.claim_seconds)),
+        )
+        return _prompt(reminders, clock, float(args.poll), str(args.db))
     finally:
         store.close()
 
@@ -273,7 +304,7 @@ def _prompt(reminders: Reminders, clock: Clock, poll: float, db: str) -> int:
     runner = Runner(reminders, clock, poll_seconds=poll)
     where = "in memory - lost on exit" if db == IN_MEMORY else db
     print(
-        f"stage 11 - two workers, and only one of them does the job."
+        f"stage 13 - a worker that has been replaced cannot change anything."
         f"  store: {where}  poll: {poll}s\n"
     )
     print(HELP)

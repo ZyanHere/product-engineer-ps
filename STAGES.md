@@ -1290,6 +1290,18 @@ watch worker B
 
 ### What happens
 
+*Measured.* Worker A claims a reminder, sends, and dies. Worker B is alive, healthy, and polling:
+
+```
+worker B at +  0d: due=0  fired=0
+worker B at +  1d: due=0  fired=0
+worker B at +  7d: due=0  fired=0
+worker B at +365d: due=0  fired=0
+
+state:        running
+attempt 1:    outcome=None  finished_at=None
+```
+
 Two things, one obvious and one only visible if you look at the history.
 
 **The reminder sits in `running` forever.** Worker B never touches it. It never fires and it never fails — it simply stops, in a state that looks like progress.
@@ -1344,10 +1356,32 @@ One thing that does *not* need doing, and it is a nice payoff from the previous 
 - the record is never later rewritten to success or failure
 - the reminder is eventually delivered despite the crash
 - the expiry survives a restart of everything
+- a takeover does not touch **another** reminder's history — the mutation is to drop the `reminder_id` clause, which would close every open attempt in the database including the one a live worker is in the middle of
+- a fresh claim closes nothing (the negative control, so the test above cannot pass for the wrong reason)
+- a reminder crashed all the way through its budget still ends — Stage 10 and Stage 12 have to compose
+
+### The eight xfails come back green
+
+Stage 11 took away crash recovery and eight tests across Stages 9 and 10 were marked `xfail(strict=True)` rather than rewritten. That choice paid for itself here: the markers were simply deleted, and the tests then told me exactly what had changed rather than what had broken.
+
+Two of them needed more than the marker removing, and both are real:
+
+- every restart now has to **wait out the dead worker's claim** before it may take the work. The recovery is the same; it costs one claim window, which is the price of not being able to tell a dead worker from a slow one.
+- `test_the_crash_does_not_close_the_attempt_it_interrupted` was renamed. Stage 9 asserted the interrupted record *stays open forever*, because tidying it would have been a guess written down as a fact. Stage 12 changed **when** it is closed, not **what it is allowed to say** — so it is now `test_the_interrupted_attempt_is_closed_only_as_unknown`.
+
+### Where `claimed_by` stands
+
+Recorded, and **nothing compares it.** No decision in this system is made by looking at a worker id; the takeover's conditional write does not mention it. It is there so a takeover has an attributable victim and beneficiary — with more than one worker, *"this reminder was taken from somebody"* is not actionable unless you can see it is always the same somebody.
+
+Said plainly because Stage 13 is where comparing identities stops being observability and starts being correctness, and where a plain identity turns out not to be enough.
 
 ### Still broken
 
 We just said the expiry does not mean the worker is dead. So what happens when it is not?
+
+Nothing. The takeover is written entirely in terms of *we are no longer willing to wait*, and that sentence is carefully silent about the other worker, which was honest and is not enough. A worker whose claim expired is not told, cannot find out, and will finish the work it believes it still owns — writing an outcome for an attempt that somebody else has already recorded as `unknown` and replaced.
+
+Two values now exist that were the same thing a stage ago: *what state is this reminder in* and *who owns it*. The takeover made them come apart — `running` → `running`, ownership changed, state did not — and nothing yet uses the difference.
 
 ### Next question
 
@@ -1380,9 +1414,24 @@ make the send take 40
   12:00:40   A finishes, and records it delivered too
 ```
 
-A wrote over a job that stopped being its own ten seconds earlier.
+A wrote over a job that stopped being its own ten seconds earlier. *Measured:*
 
-Today both wrote `delivered`, so the damage is invisible. Change one variable — A's send *failed* while B's succeeded — and A turns a delivered reminder back into a scheduled one.
+```
+A claims, starts sending      state=running   attempts=[None]
+B takes over and delivers     state=delivered attempts=['unknown', 'delivered']
+A finishes and writes too     state=delivered attempts=['delivered', 'delivered']
+```
+
+Both wrote `delivered`, so the damage looks survivable. Change one variable — A's send *failed* while B's succeeded:
+
+```
+after B delivers:  state=delivered  next_attempt_at=None
+after A's failure: state=scheduled  next_attempt_at=12:05:00
+```
+
+**A turned a delivered reminder back into a scheduled one.** It will be sent again.
+
+And a third fault that was not in the plan, visible in the first block: A's write turned `['unknown', 'delivered']` into `['delivered', 'delivered']`. **Stage 12 promised `unknown` was permanent and never revised.** This is the one way it could be revised — which is why the attempt write now sits *inside* the fenced transaction rather than beside it.
 
 ### Why
 
@@ -1418,6 +1467,8 @@ Two consequences worth stating, because they are the payoff for this whole chapt
   - **13.3.1** enumerate them. Not just "mark delivered" — also marking failed, also putting it back for a retry, also releasing it
   - **13.3.2** the release is the dangerous one, and the least obvious. If a replaced worker can put the reminder back while the current worker is still sending, a **third** worker picks it up — three sends, not two
 - **13.4** a worker whose write matches nothing stops quietly and records nothing about the reminder
+- **13.5** *ordering found while building:* in `open_attempt` the attempt row is inserted **before** the fence is checked, and the whole thing rolls back on a mismatch
+  - **13.5.1** checking the fence first is the obvious order and it silently disarmed the foreign key: an attempt naming a reminder that does not exist stopped raising and started being reported as an ordinary lost claim. A bug that looks like contention is a bug nobody investigates
 
 ### The caveat, stated rather than discovered later
 
@@ -1438,9 +1489,21 @@ The accurate statement is therefore: **the claim duration is safety-neutral but 
 - and, separately, **assert the coupling above rather than denying it**: with a claim shorter than the send and a destination that never fails, a reminder exhausts its budget on takeovers alone
 - deleting the number from any one write makes a specific test fail — one mutation per write path
 
+### What the mutations found
+
+Eight were run, one per write path plus the shape of the transaction. Seven were caught by the tests as first written. **One was not**, and it is the one worth recording:
+
+> changing `if settle_delivered(...)` to `if settle_delivered(...) or True` — the service honouring a rejected write and reporting it anyway — **passed the entire suite.**
+
+Every Stage 13 test drove the store directly, so none of them could see whether the *service* respected the answer it got. 13.4 was implemented and untested.
+
+Fixing it turned out to need no new machinery, only a better reading of what a slow send is. `tick()` claims, sends and settles in one breath, so "the claim expired mid-send" seemed inexpressible through it — but **the destination *is* the send**, so a destination that lets another worker take over while it is sending is exactly that scenario. The test now runs end to end: A sends, is replaced while sending, and reports nothing at all.
+
 ### Still broken
 
 Every guard so far protects workers from each other. Nothing protects against **the user**.
+
+And one limitation of the *model*, rather than of the system, worth naming because it shaped every test here. `tick(now)` uses a single instant for the claim, the attempt record and the settlement, so `started_at` and `finished_at` on an attempt are always equal and a send that takes real time cannot be expressed through the service. It made no difference to what this stage had to prove — **what matters is the order of the writes, not the seconds between them** — but it does mean an attempt record cannot currently answer "how long did that send take?". Giving the service a clock would fix it and nothing yet needs it to.
 
 ### Next question
 

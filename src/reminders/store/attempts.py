@@ -99,6 +99,34 @@ class AttemptTable:
             (finished_at.isoformat(), outcome, error, attempt_id),
         )
 
+    def close_unfinished(self, reminder_id: int, finished_at: datetime) -> int:
+        """Close every open attempt against one reminder as `unknown`. Stage 12.
+
+        What a takeover owes the history it inherits. The previous holder opened a
+        record before its send -- which is Stage 9's whole point -- and then died,
+        and it was the only process that was ever going to close it.
+
+        The outcome is `unknown` and that is the honest answer, not a placeholder.
+        Not `delivered`: we do not know that. Not `refused`: we do not know that
+        either. **We will never know**, because the three worlds Stage 9 named are
+        indistinguishable from here and always will be, so this row is never
+        revised afterwards. A record that later claimed to know would be inventing
+        knowledge.
+
+        `finished_at` is when we gave up on it, not when it ended -- nobody knows
+        when it ended. The pair (`started_at`, `finished_at`) on an `unknown` row
+        reads as "it was open for at least this long", which is true.
+
+        Returns how many were closed, which is almost always 0 (an ordinary claim
+        inherits nothing) and is the number a takeover test asserts on.
+        """
+        cursor = self._connection.execute(
+            "UPDATE attempt SET finished_at = ?, outcome = 'unknown' "
+            "WHERE reminder_id = ? AND outcome IS NULL",
+            (finished_at.isoformat(), reminder_id),
+        )
+        return int(cursor.rowcount)
+
     def for_reminder(self, reminder_id: int) -> list[Attempt]:
         """Every attempt against one reminder, oldest first."""
         rows = self._connection.execute(

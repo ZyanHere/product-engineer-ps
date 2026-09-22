@@ -34,6 +34,7 @@ ticks produce.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,19 @@ from reminders.delivery import DeduplicatingDestination, LedgerDestination, Refu
 from reminders.service import Reminders
 from reminders.store import Store
 from tests.shared import DUE_AT, naive
+
+
+def _claim(store: Store, reminder_id: int, worker: str = "w") -> int | None:
+    """`store.claim` with the later stages' arguments filled in.
+
+    These tests are about *who wins*, not about expiry, so they all claim at
+    `DUE_AT` for an hour. Stage 12's own tests are where the window matters.
+
+    Since Stage 13 the return value is the winner's **fencing token** rather than a
+    bare yes -- `None` still means somebody else got there first, which is all
+    these tests look at.
+    """
+    return store.claim(reminder_id, DUE_AT, DUE_AT + timedelta(hours=1), worker)
 
 
 def _two_workers(path: Path, **kwargs: int) -> tuple[Store, Store, int]:
@@ -68,8 +82,8 @@ def test_exactly_one_of_two_workers_gets_the_claim(tmp_path: Path) -> None:
     try:
         assert a.due(DUE_AT) and b.due(DUE_AT)  # both see it, which is fine
 
-        assert a.claim(rid) is True
-        assert b.claim(rid) is False
+        assert _claim(a, rid) is not None
+        assert _claim(b, rid) is None
     finally:
         a.close()
         b.close()
@@ -79,9 +93,9 @@ def test_the_loser_changes_nothing(tmp_path: Path) -> None:
     """Losing is not a partial write. The row is exactly as the winner left it."""
     a, b, rid = _two_workers(tmp_path / "r.db")
     try:
-        a.claim(rid)
+        _claim(a, rid)
         before = b.load_all()[0]
-        b.claim(rid)
+        _claim(b, rid)
         after = b.load_all()[0]
     finally:
         a.close()
@@ -99,7 +113,7 @@ def test_a_claimed_reminder_is_invisible_to_everyone_else(tmp_path: Path) -> Non
     """
     a, b, rid = _two_workers(tmp_path / "r.db")
     try:
-        a.claim(rid)
+        _claim(a, rid)
         assert b.due(DUE_AT) == []
         assert a.due(DUE_AT) == []  # including the worker holding it
     finally:
@@ -210,7 +224,7 @@ def test_losing_a_claim_is_not_an_error_and_does_not_stop_the_worker(
         stale = b.due(DUE_AT)  # B polls: it can see all three
         assert [r.text for r in stale] == ["first", "second", "third"]
 
-        assert a.claim(made[1].id) is True  # A takes the middle one, after B's read
+        assert _claim(a, made[1].id) is not None  # A takes it, after B's read
 
         # B now acts on what it read, which is what the gap means.
         monkeypatch.setattr(b, "due", lambda now: stale)
@@ -274,7 +288,7 @@ def test_eight_workers_racing_produce_one_winner_and_seven_clean_losses(
         try:
             barrier.wait()
             try:
-                outcome: object = store.claim(created.id)
+                outcome: object = _claim(store, created.id) is not None
             except sqlite3.Error as exc:  # a loss that is not ordinary
                 outcome = f"{type(exc).__name__}: {exc}"
             with guard:
@@ -351,36 +365,39 @@ def test_a_reminder_can_be_reclaimed_after_it_is_handed_back(tmp_path: Path) -> 
         Reminders(a, RefusingDestination()).tick(DUE_AT)  # A tries, fails, releases
         later = b.load_all()[0].next_attempt_at
         assert later is not None
-        assert b.claim(rid) is True  # B can now take it
+        assert _claim(b, rid) is not None  # B can now take it
     finally:
         a.close()
         b.close()
 
 
-# -- what this stage broke ---------------------------------------------------
+# -- what this stage broke, and how long for ---------------------------------
 
 
-def test_a_crashed_worker_strands_its_reminder(tmp_path: Path) -> None:
-    """Stated as a defect, not discovered as a surprise.
+def test_a_claimed_reminder_is_nobody_elses_until_the_claim_runs_out(
+    tmp_path: Path,
+) -> None:
+    """What Stage 11 contributed, and the hole it left.
 
-    A claim has no expiry, so a worker that dies holding one leaves the reminder in
-    `running` where `due()` cannot see it -- by *anybody*, forever. Stage 11 traded
-    a duplicate for a disappearance.
+    This test was written as `test_a_crashed_worker_strands_its_reminder` and
+    asserted *forever* -- the one test in the suite stating broken behaviour on
+    purpose, alongside eight `xfail(strict=True)` markers on the recovery
+    behaviour Stage 11 had taken away.
 
-    This is the only test in the suite asserting broken behaviour on purpose. The
-    eight tests that state the behaviour we lost are marked `xfail(strict=True)`, so
-    the moment Stage 12 restores recovery they fail for passing and have to be
-    un-marked. This one is the positive half of the same record.
+    Stage 12 gave the claim an ending, so the eight markers are gone and this now
+    asserts the half that is still true and still Stage 11's: while a claim
+    stands, the reminder is nobody else's. A crashed worker costs a delay of
+    exactly one claim window -- the price of not being able to tell a dead worker
+    from a slow one.
     """
-    import pytest
-
+    from reminders.claims import CLAIM_DURATION
     from reminders.delivery import CrashAfterSendDestination, SimulatedCrash
 
     path = tmp_path / "r.db"
     phone = DeduplicatingDestination()
 
     store = Store.open(path)
-    reminders = Reminders(store, CrashAfterSendDestination(phone))
+    reminders = Reminders(store, CrashAfterSendDestination(phone), claim_for=CLAIM_DURATION)
     reminders.create(naive(DUE_AT), "UTC", "Call the clinic")
     with pytest.raises(SimulatedCrash):
         reminders.tick(DUE_AT)
@@ -390,11 +407,15 @@ def test_a_crashed_worker_strands_its_reminder(tmp_path: Path) -> None:
     try:
         row = survivor.load_all()[0]
         assert row.state == "running"  # held by a process that no longer exists
-        assert survivor.due(DUE_AT) == []
-        # A year later, still nobody's.
-        from datetime import timedelta
+        assert row.claimed_until == DUE_AT + CLAIM_DURATION
+        assert row.claimed_by is not None
 
-        assert survivor.due(DUE_AT + timedelta(days=365)) == []
-        assert survivor.unfinished_attempts()  # the only trace that anything happened
+        # Nobody else's while the claim stands, however healthy they are.
+        assert survivor.due(DUE_AT) == []
+        assert survivor.due(DUE_AT + CLAIM_DURATION / 2) == []
+        assert survivor.unfinished_attempts()  # the only trace anything happened
+
+        # And available the moment it does not.
+        assert len(survivor.due(DUE_AT + CLAIM_DURATION)) == 1
     finally:
         survivor.close()

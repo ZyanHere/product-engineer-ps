@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from reminders.claims import CLAIM_DURATION
 from reminders.clock import FakeClock
 from reminders.delivery import (
     CrashAfterSendDestination,
@@ -42,18 +43,28 @@ from reminders.model import Reminder
 from reminders.runner import Runner
 from reminders.service import Reminders
 from reminders.store import Store
-from tests.shared import DUE_AT, STRANDED, naive
+from tests.shared import DUE_AT, naive
+
+# A reminder nobody has claimed has `claim_seq = 0`, and Stage 13 requires every
+# worker write to carry the current one. Tests that drive the store directly,
+# without a claim, pass 0 for it. A real worker can never hold 0: `claim()` bumps
+# the counter before handing it back, so the first token it can ever return is 1.
+UNCLAIMED = 0
 
 # -- the headline ------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_kill_mid_send_then_restart_gives_one_notification(tmp_path: Path) -> None:
     """The whole stage, in one test.
 
     Two presentations reach the destination -- that part is unavoidable, because
     the crash happened after the notification was already in the world. What the
     key buys is that the second presentation does not *count*.
+
+    *Stage 11 broke this and Stage 12 put it back.* The retry now has to wait out
+    the dead worker's claim, so the second process polls after the expiry rather
+    than immediately. That delay is the price of not being able to tell a dead
+    worker from a slow one.
     """
     path = tmp_path / "r.db"
     phone = DeduplicatingDestination()
@@ -66,10 +77,12 @@ def test_kill_mid_send_then_restart_gives_one_notification(tmp_path: Path) -> No
         crashing.tick(DUE_AT)
     first.close()
 
-    # process 2: a fresh start, knowing only what is on disk
+    # process 2: a fresh start, knowing only what is on disk. It has to wait for
+    # the dead worker's claim to expire before it may take the work.
     second = Store.open(path)
     try:
-        Reminders(second, phone).tick(DUE_AT)
+        assert Reminders(second, phone).tick(DUE_AT) == []  # not yet: still claimed
+        Reminders(second, phone).tick(DUE_AT + CLAIM_DURATION)
     finally:
         second.close()
 
@@ -77,7 +90,6 @@ def test_kill_mid_send_then_restart_gives_one_notification(tmp_path: Path) -> No
     assert phone.repeats == ["Call the clinic"]  # and one recognised repeat
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
 def test_every_presentation_carries_the_same_key(tmp_path: Path) -> None:
     """Our half of the claim, checked against a destination that merges nothing.
 
@@ -98,7 +110,7 @@ def test_every_presentation_carries_the_same_key(tmp_path: Path) -> None:
 
     second = Store.open(path)
     try:
-        Reminders(second, ledger).tick(DUE_AT)
+        Reminders(second, ledger).tick(DUE_AT + CLAIM_DURATION)
     finally:
         second.close()
 
@@ -230,13 +242,16 @@ def test_a_clean_run_leaves_no_unfinished_attempts() -> None:
     assert store.unfinished_attempts() == []
 
 
-@pytest.mark.xfail(strict=True, reason=STRANDED)
-def test_the_crash_does_not_close_the_attempt_it_interrupted(tmp_path: Path) -> None:
-    """The retry opens a *second* attempt; the first stays open.
+def test_the_interrupted_attempt_is_closed_only_as_unknown(tmp_path: Path) -> None:
+    """The retry opens a *second* attempt. The first is never called a success.
 
-    Tempting to tidy up on restart -- and wrong, because from in here "abandoned"
-    and "still in flight" are the same row. Closing it would be a guess written
-    down as a fact. Stage 12 is where something can tell them apart.
+    Written at Stage 9 as "the first stays open forever", because tidying it up
+    would have been a guess written down as a fact.
+
+    Stage 12 changed *when* it is closed, not *what it is allowed to say*. A
+    takeover closes it -- somebody has to, and the process that opened it is gone
+    -- and the only honest outcome is `unknown`. Not delivered, not refused: the
+    three worlds are still indistinguishable and always will be.
     """
     path = tmp_path / "r.db"
     phone = DeduplicatingDestination()
@@ -250,13 +265,14 @@ def test_the_crash_does_not_close_the_attempt_it_interrupted(tmp_path: Path) -> 
 
     second = Store.open(path)
     try:
-        Reminders(second, phone).tick(DUE_AT)
+        assert second.attempts(created.id)[0].unfinished  # open until somebody takes it
+        Reminders(second, phone).tick(DUE_AT + CLAIM_DURATION)
         history = second.attempts(created.id)
     finally:
         second.close()
 
-    assert [a.unfinished for a in history] == [True, False]
-    assert history[1].outcome == "delivered"
+    assert [a.outcome for a in history] == ["unknown", "delivered"]
+    assert history[0].error is None  # nothing invented about why
 
 
 # -- the history -------------------------------------------------------------
@@ -304,7 +320,7 @@ def test_ordering_is_stable_when_every_attempt_shares_one_instant() -> None:
     created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=50)
 
     for _ in range(20):
-        store.open_attempt(created.id, DUE_AT)  # same instant, twenty times
+        store.open_attempt(created.id, DUE_AT, UNCLAIMED)  # same instant, twenty times
 
     history = store.attempts(created.id)
     assert len(history) == 20
@@ -328,9 +344,11 @@ def test_ordering_survives_a_clock_that_went_backwards() -> None:
     reminders = Reminders(store, RefusingDestination())
     created = reminders.create(naive(DUE_AT), "UTC", "Call the clinic", max_attempts=50)
 
-    first = store.open_attempt(created.id, DUE_AT)
-    second = store.open_attempt(created.id, DUE_AT - timedelta(hours=1))  # clock stepped back
-    third = store.open_attempt(created.id, DUE_AT + timedelta(minutes=1))
+    first = store.open_attempt(created.id, DUE_AT, UNCLAIMED)
+    second = store.open_attempt(
+        created.id, DUE_AT - timedelta(hours=1), UNCLAIMED
+    )  # clock stepped back
+    third = store.open_attempt(created.id, DUE_AT + timedelta(minutes=1), UNCLAIMED)
 
     assert [a.id for a in store.attempts(created.id)] == [first, second, third]
 
@@ -362,7 +380,7 @@ def test_an_attempt_cannot_name_a_reminder_that_does_not_exist() -> None:
 
     store = Store.open()
     with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
-        store.open_attempt(999, DUE_AT)
+        store.open_attempt(999, DUE_AT, UNCLAIMED)
 
 
 # -- no transaction across the send -----------------------------------------

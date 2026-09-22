@@ -3,7 +3,7 @@
 Built by the sequence in STAGES.md: something small that works, then break it,
 then fix the one real problem that broke.
 
-Right now: Stage 11. A reminder is created in a local time and a zone, stored,
+Right now: Stage 13. A reminder is created in a local time and a zone, stored,
 delivered when it is owed, and -- if the destination refuses -- the refusal is
 written down, the next attempt is further away than the last, and the retrying
 ends, either because the budget ran out or because the destination said something
@@ -15,10 +15,18 @@ A crash costs an attempt, so a crashing system still runs out of road rather
 than presenting the same reminder forever. Two workers can run against the same
 database and exactly one of them executes a given reminder.
 
-Not true yet, and on purpose: **a claim has no expiry**, so a worker killed while
-holding one strands its reminder where nobody will ever pick it up again -- Stage
-11 traded a duplicate for a disappearance, and Stage 12 is where a claim gets an
-ending. An attempt left open is still never closed by anything.
+A claim expires, so a worker killed while holding one costs a delay of one claim
+window rather than the reminder -- and whoever takes over closes the half-written
+record its predecessor left behind, as *we never found out*, permanently.
+
+A worker that has been replaced cannot change anything. Every write it makes
+carries the number it was handed when it claimed the work, and the row has moved
+past it -- so it finds out it is no longer in charge the only way that needs no
+notification: by writing, and being told nothing changed.
+
+Not true yet, and on purpose: every guard so far protects workers from each
+other. Nothing protects against **the user** editing a reminder while a worker is
+in the middle of sending it.
 """
 
 __all__ = ["__version__"]

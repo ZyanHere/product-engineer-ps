@@ -24,21 +24,7 @@ from datetime import UTC, datetime
 
 from reminders.delivery import NullDestination
 
-__all__ = ["DUE_AT", "START", "STRANDED", "SUCCEEDS", "naive"]
-
-STRANDED = (
-    "Stage 11 gave claims no expiry, so a worker killed mid-send strands its "
-    "reminder in `running` and nothing will ever pick it up again. Stage 12 gives "
-    "a claim an ending; these tests state the behaviour that must come back."
-)
-"""Why the crash-recovery tests are `xfail` for exactly one stage.
-
-Used with **`strict=True`**, which is the whole point: a strict xfail that
-starts passing is reported as a failure. So the moment Stage 12 restores
-recovery, every one of these goes red and has to be un-marked. The alternative
--- rewriting the assertions to match the broken behaviour -- would have quietly
-lowered the bar and left nothing to notice when it could be raised again.
-"""
+__all__ = ["DUE_AT", "START", "SUCCEEDS", "naive"]
 
 START = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
 """A plain instant to start a clock at. One hour before `DUE_AT`."""

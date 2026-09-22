@@ -126,16 +126,33 @@ class Store:
         """Reminders that are owed and still open. See `reminders.due`."""
         return self._reminders.due(now)
 
-    def claim(self, reminder_id: int) -> bool:
-        """Move a reminder from `scheduled` to `running`, if it is still going.
+    def claim(self, reminder_id: int, now: datetime, until: datetime, worker: str) -> int | None:
+        """Take a reminder, whether it is free or merely abandoned.
 
-        One conditional write, committed immediately, and the return value is the
-        only thing a worker needs: *did I get it?* Two workers both ask, the
-        database serialises them, one gets True and one gets False.
+        One conditional write, and the return value is the only thing a worker
+        needs: *did I get it?* Two workers both ask, the database serialises them,
+        one gets True and one gets False.
+
+        **A successful takeover also closes whatever the previous holder left
+        open**, in the same transaction. Splitting them would leave a moment where
+        the reminder has a new owner and a dangling record from the old one -- and
+        a crash in that moment makes it permanent, which is the exact defect this
+        stage exists to remove.
+
+        Nothing needs reconciling on the budget side, and that is a payoff from
+        Stage 10: the abandoned attempt was charged when it was **opened**, so it
+        has already been paid for. Had the charge stayed on the settle path, a
+        takeover would now have to decide whether to bill for a send it knows
+        nothing about.
+
+        Returns the **fencing token** the winner must carry on every write it goes
+        on to make, or `None` if the claim was not won. Stage 13.
         """
         with self._transaction():
-            won = self._reminders.claim(reminder_id)
-        return won
+            fence = self._reminders.claim(reminder_id, now, until, worker)
+            if fence is not None:
+                self._attempts.close_unfinished(reminder_id, now)
+        return fence
 
     def insert(
         self,
@@ -170,18 +187,34 @@ class Store:
     # to roll back. So instead of pretending, the record is written first and its
     # unfinished shape is allowed to mean something.
 
-    def open_attempt(self, reminder_id: int, started_at: datetime) -> int:
+    def open_attempt(self, reminder_id: int, started_at: datetime, fence: int) -> int | None:
         """Write down that we are about to try, and spend an attempt for it.
 
-        One transaction, committed before the send. Stage 10 moved the charge
-        here from the settle path, and the two writes are together for the same
-        reason Stage 8's two were: an attempt row that exists without having been
-        paid for is a free crash, and a charge without a row is a number nobody
-        can explain.
+        One transaction, committed before the send. Stage 10 moved the charge here
+        from the settle path, and the two writes are together for the same reason
+        Stage 8's two were: an attempt row that exists without having been paid for
+        is a free crash, and a charge without a row is a number nobody can explain.
+
+        Fenced since Stage 13, and it returns `None` for a worker that has already
+        been replaced. The window between winning a claim and recording the attempt
+        is microseconds wide and it is real; a worker replaced inside it would
+        otherwise open a record and spend a budget for a reminder that is no longer
+        its own.
         """
-        with self._transaction():
+        self._connection.execute("BEGIN")
+        try:
+            # The attempt row goes first so the foreign key still does its job: an
+            # attempt naming a reminder that does not exist must fail loudly rather
+            # than be reported as a lost claim. Checking the fence first would have
+            # made every such bug look like ordinary contention.
             attempt_id = self._attempts.start(reminder_id, started_at)
-            self._reminders.charge_attempt(reminder_id)
+            if not self._reminders.charge_attempt(reminder_id, fence):
+                self._connection.rollback()
+                return None
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
         return attempt_id
 
     def attempts(self, reminder_id: int) -> list[Attempt]:
@@ -194,7 +227,9 @@ class Store:
 
     # -- settling -----------------------------------------------------------
 
-    def settle_delivered(self, attempt_id: int, reminder_id: int, finished_at: datetime) -> None:
+    def settle_delivered(
+        self, attempt_id: int, reminder_id: int, finished_at: datetime, fence: int
+    ) -> bool:
         """It went out.
 
         The attempt was already charged when it opened, successes included.
@@ -202,9 +237,13 @@ class Store:
         failed" -- a delivery on the third try should read as three attempts,
         because that is what the destination saw.
         """
-        with self._transaction():
-            self._attempts.finish(attempt_id, finished_at, "delivered", None)
-            self._reminders.mark_delivered(reminder_id)
+        return self._settle_fenced(
+            attempt_id,
+            finished_at,
+            "delivered",
+            None,
+            lambda: self._reminders.mark_delivered(reminder_id, fence),
+        )
 
     def settle_retry(
         self,
@@ -213,11 +252,16 @@ class Store:
         finished_at: datetime,
         error: str,
         next_attempt_at: datetime,
-    ) -> None:
-        """Refused, with budget left. The reminder stays `scheduled`."""
-        with self._transaction():
-            self._attempts.finish(attempt_id, finished_at, "refused", error)
-            self._reminders.defer(reminder_id, next_attempt_at)
+        fence: int,
+    ) -> bool:
+        """Refused, with budget left. The reminder goes back to `scheduled`."""
+        return self._settle_fenced(
+            attempt_id,
+            finished_at,
+            "refused",
+            error,
+            lambda: self._reminders.defer(reminder_id, next_attempt_at, fence),
+        )
 
     def settle_failed(
         self,
@@ -227,7 +271,8 @@ class Store:
         outcome: AttemptOutcome,
         error: str,
         reason: FailureReason,
-    ) -> None:
+        fence: int,
+    ) -> bool:
         """The end of the road: no budget left, or an answer that cannot change.
 
         `outcome` and `reason` say different things and both are worth keeping. The
@@ -236,11 +281,44 @@ class Store:
         which way to look: `retries_exhausted` says go and look at the destination,
         `permanent_error` says go and look at the reminder.
         """
-        with self._transaction():
-            self._attempts.finish(attempt_id, finished_at, outcome, error)
-            self._reminders.fail(reminder_id, reason)
+        return self._settle_fenced(
+            attempt_id,
+            finished_at,
+            outcome,
+            error,
+            lambda: self._reminders.fail(reminder_id, reason, fence),
+        )
 
-    def abandon(self, reminder_id: int, reason: FailureReason) -> None:
+    def _settle_fenced(
+        self,
+        attempt_id: int,
+        finished_at: datetime,
+        outcome: AttemptOutcome,
+        error: str | None,
+        move_reminder: Callable[[], bool],
+    ) -> bool:
+        """Close the attempt and move the reminder, or do neither.
+
+        The reminder is written **first** and the attempt only if that landed,
+        which is the ordering Stage 13 needs. A replaced worker must not touch the
+        history either: its predecessor's record has already been closed as
+        `unknown` by whoever took over, and Stage 12 promised that value is never
+        revised. Writing the attempt first and rolling back would be equivalent
+        here; checking first just avoids issuing a write nobody wants.
+        """
+        self._connection.execute("BEGIN")
+        try:
+            if not move_reminder():
+                self._connection.rollback()
+                return False
+            self._attempts.finish(attempt_id, finished_at, outcome, error)
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
+        return True
+
+    def abandon(self, reminder_id: int, reason: FailureReason, fence: int) -> bool:
         """Close a reminder without attempting it. Stage 10.
 
         Needed because Stage 10 made a state possible that Stage 8's invariant
@@ -252,9 +330,14 @@ class Store:
         the loop would have to open an attempt just to have something to close,
         which would present the reminder once more than its budget allows and
         charge for the privilege.
+
+        Fenced like every other worker write. This one closes a reminder without
+        sending anything, so a replaced worker reaching it would declare somebody
+        else's in-flight work a failure.
         """
         with self._transaction():
-            self._reminders.fail(reminder_id, reason)
+            landed = self._reminders.fail(reminder_id, reason, fence)
+        return landed
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:

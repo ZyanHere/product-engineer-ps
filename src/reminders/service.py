@@ -67,13 +67,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from reminders.claims import CLAIM_DURATION, new_worker_id
 from reminders.delivery import DeliveryError, PermanentDeliveryError
 from reminders.model import Attempt, AttemptOutcome, Delivery, FailureReason, Reminder
 from reminders.retry import MAX_ATTEMPTS, next_delay
 from reminders.timezones import resolve
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from reminders.delivery import Destination
     from reminders.store import Store
@@ -89,13 +90,31 @@ class Reminders:
     reconcile after a restart.
     """
 
-    def __init__(self, store: Store, destination: Destination) -> None:
+    def __init__(
+        self,
+        store: Store,
+        destination: Destination,
+        *,
+        worker: str | None = None,
+        claim_for: timedelta = CLAIM_DURATION,
+    ) -> None:
         # `destination` has no default, deliberately. A default would let
         # somebody build this and have no idea where its notifications go -- and
         # the one honest default, "print to stdout", is wrong for every caller
         # that is not a terminal.
         self._store = store
         self._destination = destination
+
+        # `worker` does have a default, because unlike a destination there is
+        # exactly one sensible one: a fresh name for a fresh worker. Nothing
+        # compares these, so getting it wrong costs a confusing report rather
+        # than a wrong decision.
+        self._worker = worker or new_worker_id()
+
+        # Per-instance rather than a module constant read at the point of use, so
+        # a test can make a claim expire in a millisecond instead of five minutes.
+        # Stage 13's break is precisely "make the send take longer than this".
+        self._claim_for = claim_for
 
     def create(
         self,
@@ -145,6 +164,31 @@ class Reminders:
         Losing a claim is not a failure and is not retried. Somebody else is doing
         the work; move on to the next candidate.
 
+        Since Stage 12 the same call also **takes over** work whose holder has run
+        out of time, and closes whatever half-written record that holder left
+        behind. One statement covers both, so there is no "fresh claim or
+        takeover?" branch here and no window between deciding and taking.
+
+        The expiry it writes says nothing about anybody being alive. It says *we
+        are no longer willing to wait* -- which is a judgement this process can
+        make, and "is that worker dead?" is not.
+
+        **Stage 13 is what makes that silence safe.** A claim hands back a fencing
+        token, and every write below carries it. A worker that was replaced
+        mid-send -- because it was slow, not because it was dead -- comes back
+        holding a number the row has moved past, and each of its writes matches
+        nothing. It is never notified and never needs to be: it finds out by
+        writing and being told nothing changed.
+
+        So the question this system cannot answer stops mattering. We never needed
+        to know whether a worker was dead or slow. We needed its writes ignored
+        once it had been replaced, which is a different question with an answer.
+
+        Every `if not ...` below is one of those writes. A worker that loses the
+        race **records nothing at all** about the reminder: the current holder's
+        account of it is the only one, and a second opinion from a worker that no
+        longer owns the job is exactly the damage being prevented.
+
         Then three steps per reminder, and the order is the whole of Stage 9:
 
             commit    open an attempt, with no outcome
@@ -183,36 +227,46 @@ class Reminders:
         deliveries: list[Delivery] = []
 
         for reminder in self._store.due(now):
-            if not self._store.claim(reminder.id):
+            fence = self._store.claim(reminder.id, now, now + self._claim_for, self._worker)
+            if fence is None:
                 continue  # somebody else has it. Nothing to do, nothing to undo.
 
             if reminder.attempts_left() == 0:
                 # Charged for attempts that never reported back. Nothing left to
                 # spend, so nothing is sent and nothing is charged -- it is simply
                 # closed, and says why.
-                self._store.abandon(reminder.id, "retries_exhausted")
-                deliveries.append(
-                    Delivery(
-                        reminder,
-                        error="gave up without trying: no attempts left",
-                        failure_reason="retries_exhausted",
+                if self._store.abandon(reminder.id, "retries_exhausted", fence):
+                    deliveries.append(
+                        Delivery(
+                            reminder,
+                            error="gave up without trying: no attempts left",
+                            failure_reason="retries_exhausted",
+                        )
                     )
-                )
                 continue
 
-            attempt_id = self._store.open_attempt(reminder.id, now)
+            attempt_id = self._store.open_attempt(reminder.id, now, fence)
+            if attempt_id is None:
+                continue  # replaced between claiming and recording it
+
             try:
                 self._destination.send(reminder)
             except PermanentDeliveryError as exc:
-                deliveries.append(self._give_up(attempt_id, reminder, now, exc, "rejected"))
+                landed = self._give_up(attempt_id, reminder, now, exc, "rejected", fence)
+                if landed is not None:
+                    deliveries.append(landed)
             except DeliveryError as exc:
                 if reminder.attempts_left(charged_since=1) > 0:
-                    deliveries.append(self._defer(attempt_id, reminder, now, exc))
+                    deferred = self._defer(attempt_id, reminder, now, exc, fence)
+                    if deferred is not None:
+                        deliveries.append(deferred)
                 else:
-                    deliveries.append(self._give_up(attempt_id, reminder, now, exc, "refused"))
+                    landed = self._give_up(attempt_id, reminder, now, exc, "refused", fence)
+                    if landed is not None:
+                        deliveries.append(landed)
             else:
-                self._store.settle_delivered(attempt_id, reminder.id, now)
-                deliveries.append(Delivery(reminder))
+                if self._store.settle_delivered(attempt_id, reminder.id, now, fence):
+                    deliveries.append(Delivery(reminder))
 
         return deliveries
 
@@ -222,7 +276,8 @@ class Reminders:
         reminder: Reminder,
         now: datetime,
         exc: DeliveryError,
-    ) -> Delivery:
+        fence: int,
+    ) -> Delivery | None:
         """Refused, with budget left: try again, further away than last time.
 
         The delay comes from a column, so it is the same answer after a restart as
@@ -234,9 +289,19 @@ class Reminders:
         that just failed -- so the first failure asks for `next_delay(0)`, the
         shortest gap. That is the intended reading: the delay is a function of how
         many times this has *already* gone wrong.
+
+        **The most dangerous write in the system to leave unfenced**, and the least
+        obvious. This one hands the reminder *back*. A replaced worker allowed to
+        do that while the current holder is still sending gives the work to a
+        **third** worker -- three presentations, not two. Marking something
+        delivered twice is untidy; this manufactures work.
+
+        Returns `None` when the write did not land, meaning we are no longer the
+        holder and have nothing to report.
         """
         retry_at = now + next_delay(reminder.attempt_count)
-        self._store.settle_retry(attempt_id, reminder.id, now, str(exc), retry_at)
+        if not self._store.settle_retry(attempt_id, reminder.id, now, str(exc), retry_at, fence):
+            return None
         return Delivery(reminder, error=str(exc), retry_at=retry_at)
 
     def _give_up(
@@ -246,7 +311,8 @@ class Reminders:
         now: datetime,
         exc: DeliveryError,
         outcome: AttemptOutcome,
-    ) -> Delivery:
+        fence: int,
+    ) -> Delivery | None:
         """The end of the road, for one of the two possible reasons.
 
         `outcome` is what *this attempt* got; the reason is why *the reminder*
@@ -255,7 +321,10 @@ class Reminders:
         for an attempt to end and that stops being true.
         """
         reason: FailureReason = "permanent_error" if outcome == "rejected" else "retries_exhausted"
-        self._store.settle_failed(attempt_id, reminder.id, now, outcome, str(exc), reason)
+        if not self._store.settle_failed(
+            attempt_id, reminder.id, now, outcome, str(exc), reason, fence
+        ):
+            return None
         return Delivery(reminder, error=str(exc), failure_reason=reason)
 
     def all(self) -> list[Reminder]:
